@@ -1,0 +1,3 @@
+# Dev/CI-only tooling. NOT installed at submit time and NOT shipped in
+# agent.zip — see scripts/build_agent.sh's explicit allowlist.
+pytest>=8
