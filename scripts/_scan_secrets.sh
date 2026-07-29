@@ -39,9 +39,18 @@ if [[ -n "${TEAM_API_KEY:-}" ]]; then
   fi
 fi
 
+# A staged .env is only allowed if it is byte-identical to the tracked,
+# reviewed scripts/build_agent.sh source (agent.env) — anything else staged
+# as .env (e.g. a developer's real .env with live credentials) still fails.
 if [[ -e "$STAGE_DIR/.env" ]]; then
-  echo "SECRET SCAN: .env is staged for packaging — should never happen" >&2
-  FAIL=1
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$REPO_ROOT/agent.env" ]] \
+      && diff -q "$REPO_ROOT/agent.env" "$STAGE_DIR/.env" >/dev/null 2>&1; then
+    echo "  .env matches tracked agent.env: OK"
+  else
+    echo "SECRET SCAN: staged .env does not match tracked agent.env — refusing to package it" >&2
+    FAIL=1
+  fi
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

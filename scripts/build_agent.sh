@@ -20,6 +20,14 @@ REQUIRED_ROOT_FILES=(main.py jeopardy.py requirements.txt)
 # script keeps working through the whole integration timeline.
 OPTIONAL_ROOT_FILES=(contracts.py)
 
+# Non-secret deploy-time tuning knobs, tracked in git — NOT the developer's
+# own .env (gitignored, holds real credentials, never staged here). If
+# present, this is staged AS `.env` so the hosted runner sources it before
+# `python -u main.py`, per README's documented .env-in-zip mechanism. It
+# still passes through the same secret scan as everything else below.
+DEPLOY_ENV_SOURCE="agent.env"
+DEPLOY_ENV_DEST_NAME=".env"
+
 # Team-owned packages. Included only if they exist yet (Gate 1+), so this
 # script is useful from day one instead of blocking on every workstream.
 PACKAGE_DIRS=(orchestrator solver tools)
@@ -43,6 +51,13 @@ for f in "${OPTIONAL_ROOT_FILES[@]}"; do
     echo "  . skipping (not present yet): $f"
   fi
 done
+
+if [[ -f "$DEPLOY_ENV_SOURCE" ]]; then
+  cp "$DEPLOY_ENV_SOURCE" "$STAGE_DIR/$DEPLOY_ENV_DEST_NAME"
+  echo "  + $DEPLOY_ENV_SOURCE -> $DEPLOY_ENV_DEST_NAME"
+else
+  echo "  . skipping (not present yet): $DEPLOY_ENV_SOURCE"
+fi
 
 for d in "${PACKAGE_DIRS[@]}"; do
   if [[ ! -d "$d" ]]; then
