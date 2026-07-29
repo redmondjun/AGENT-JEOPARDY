@@ -350,10 +350,32 @@ class AgentOrchestrator:
                 continue
             validation_error = self._gate.validate(record, candidate)
             if validation_error:
+                if (
+                    validation_error.startswith("LOW_CONFIDENCE:")
+                    and record.solve_attempts < self._config.max_solve_attempts
+                ):
+                    self._tracker.defer(
+                        record.task_id,
+                        self._config.solve_retry_seconds,
+                        validation_error,
+                        preserve_candidate=False,
+                    )
+                    self._game.log(
+                        f"event=submission task={record.task_id} action=retry "
+                        f"reason={validation_error} "
+                        f"retry_in_seconds={self._config.solve_retry_seconds:g} "
+                        f"preserve_candidate=False "
+                        f"solve_attempt={record.solve_attempts} "
+                        f"next_attempt={record.solve_attempts + 1} "
+                        f"confidence={candidate.confidence:.3f} "
+                        f"wrong_attempts={record.wrong_attempts}"
+                    )
+                    continue
                 self._tracker.fail(record.task_id, validation_error)
                 self._game.log(
                     f"event=submission task={record.task_id} action=rejected "
                     f"reason={validation_error} attempt={record.submission_attempts} "
+                    f"solve_attempt={record.solve_attempts} "
                     f"confidence={candidate.confidence:.3f} "
                     f"wrong_attempts={record.wrong_attempts}"
                 )

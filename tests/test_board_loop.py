@@ -160,25 +160,104 @@ class BoardLoopTests(unittest.TestCase):
         finally:
             agent.close()
 
-    def test_low_confidence_candidate_never_submits(self) -> None:
+    def test_low_confidence_candidate_retries_to_cap_without_submitting(self) -> None:
         game = FakeGame(
             [{"id": "PR-A1", "category": "A", "points": 100}],
             [{"result": "correct"}],
         )
-        agent = make_orchestrator(game, AnswerSolver(confidence=0.2), self.clock)
+        solver = CountingSolver(confidence=0.2)
+        agent = make_orchestrator(game, solver, self.clock)
+        try:
+            for attempt in range(1, 4):
+                agent.run_cycle()
+                agent.drain_workers(timeout=1)
+                agent.run_cycle()
+                if attempt < 3:
+                    record = agent.tracker.snapshot("PR-A1")
+                    self.assertEqual(record.state, TileState.COOLDOWN)
+                    self.assertIsNone(record.candidate)
+                    self.clock.advance(5.0)
+
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.FAILED)
+            self.assertEqual(solver.calls, 3)
+            self.assertEqual(game.submit_calls, [])
+            self.clock.advance(5.0)
+            self.assertEqual(agent.run_cycle().dispatched, 0)
+            self.assertEqual(solver.calls, 3)
+            self.assertTrue(
+                any(
+                    "event=submission task=PR-A1 action=retry" in log
+                    and "reason=LOW_CONFIDENCE" in log
+                    and "preserve_candidate=False" in log
+                    for log in game.logs
+                )
+            )
+            terminal_log = next(
+                log
+                for log in game.logs
+                if "event=submission task=PR-A1 action=rejected" in log
+            )
+            self.assertIn("solve_attempt=3", terminal_log)
+        finally:
+            agent.close()
+
+    def test_low_confidence_scored_candidate_can_recover_with_grounding(self) -> None:
+        game = FakeGame(
+            [
+                {
+                    "id": "Q-A2",
+                    "category": "A",
+                    "points": 200,
+                    "board": "qual",
+                }
+            ],
+            [{"result": "correct"}],
+        )
+        game.phase = "round1"
+        solver = ConfidenceSequenceSolver((0.70, 0.82))
+        agent = make_orchestrator(game, solver, self.clock)
         try:
             agent.run_cycle()
             agent.drain_workers(timeout=1)
             agent.run_cycle()
-            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.FAILED)
+            first = agent.tracker.snapshot("Q-A2")
+            self.assertEqual(first.state, TileState.COOLDOWN)
+            self.assertIsNone(first.candidate)
             self.assertEqual(game.submit_calls, [])
-            self.assertTrue(
-                any(
-                    "event=submission task=PR-A1 action=rejected" in log
-                    and "reason=LOW_CONFIDENCE" in log
-                    for log in game.logs
-                )
+
+            self.clock.advance(5.0)
+            self.assertEqual(agent.run_cycle().dispatched, 1)
+            agent.drain_workers(timeout=1)
+            recovered = agent.run_cycle()
+
+            self.assertEqual(recovered.submitted, 1)
+            self.assertEqual(agent.tracker.snapshot("Q-A2").state, TileState.SOLVED)
+            self.assertEqual(solver.calls, 2)
+            self.assertEqual(game.submit_calls, [("Q-A2", "answer-Q-A2")])
+        finally:
+            agent.close()
+
+    def test_tile_claimed_during_low_confidence_cooldown_is_not_retried(self) -> None:
+        game = FakeGame(
+            [{"id": "Q-A2", "category": "A", "points": 200, "board": "qual"}]
+        )
+        game.phase = "round1"
+        solver = CountingSolver(confidence=0.70)
+        agent = make_orchestrator(game, solver, self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            agent.run_cycle()
+            self.assertEqual(
+                agent.tracker.snapshot("Q-A2").state, TileState.COOLDOWN
             )
+
+            game.tiles = []
+            self.clock.advance(5.0)
+            self.assertEqual(agent.run_cycle().dispatched, 0)
+            self.assertEqual(agent.tracker.snapshot("Q-A2").state, TileState.DEAD)
+            self.assertEqual(solver.calls, 1)
+            self.assertEqual(game.submit_calls, [])
         finally:
             agent.close()
 
@@ -238,7 +317,11 @@ class BoardLoopTests(unittest.TestCase):
             game,
             AnswerSolver(confidence=0.2),
             gate,
-            config=OrchestratorConfig(max_workers=2, max_tiles=1),
+            config=OrchestratorConfig(
+                max_workers=2,
+                max_tiles=1,
+                max_solve_attempts=1,
+            ),
             clock=self.clock,
         )
         try:
@@ -383,11 +466,23 @@ class BoardLoopTests(unittest.TestCase):
 
 
 class CountingSolver(AnswerSolver):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, confidence: float = 0.95) -> None:
+        super().__init__(confidence=confidence)
         self.calls = 0
 
     def solve(self, task: TaskContext) -> SolveResult:
+        self.calls += 1
+        return super().solve(task)
+
+
+class ConfidenceSequenceSolver(AnswerSolver):
+    def __init__(self, confidences: tuple[float, ...]) -> None:
+        super().__init__()
+        self.confidences = confidences
+        self.calls = 0
+
+    def solve(self, task: TaskContext) -> SolveResult:
+        self.confidence = self.confidences[self.calls]
         self.calls += 1
         return super().solve(task)
 

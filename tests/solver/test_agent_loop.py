@@ -500,11 +500,90 @@ def test_successful_web_output_grounds_normalized_final_answer():
     assert result.candidate.exact_value_from_tool is False
 
 
+def test_successful_grounding_tool_can_ground_short_numeric_answer():
+    for tool_name, output in (
+        ("web", '{"decoy":142,"answer":42}'),
+        ("read_file", "decoy=142; answer=42"),
+    ):
+        tool = FakeTool(tool_name, result=ToolResult(ok=True, output=output))
+        registry = ToolRegistry()
+        registry.register(
+            tool,
+            ToolSchema(tool_name, "test", {"type": "object"}),
+        )
+        client = ScriptedModelClient(
+            responses=[
+                tool_call_response(tool_name, {}),
+                text_response("FINAL_ANSWER: 42"),
+            ]
+        )
+
+        result = SolverEngine(client, registry).solve(
+            make_task(answer_format="numeric")
+        )
+
+        assert result.candidate is not None
+        assert result.candidate.value == "42"
+        assert result.candidate.confidence == 0.82
+
+
+def test_short_numeric_grounding_requires_complete_equal_token():
+    tool = FakeTool(
+        "web",
+        result=ToolResult(ok=True, output='{"answer":142,"version":"42beta"}'),
+    )
+    registry = ToolRegistry()
+    registry.register(tool, ToolSchema("web", "browse", {"type": "object"}))
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response("web", {}),
+            text_response("FINAL_ANSWER: 42"),
+        ]
+    )
+
+    result = SolverEngine(client, registry).solve(
+        make_task(answer_format="numeric")
+    )
+
+    assert result.candidate is not None
+    assert result.candidate.confidence == 0.70
+
+
+def test_status_and_unlabeled_numbers_do_not_ground_numeric_answer():
+    for answer in ("200", "42"):
+        tool = FakeTool(
+            "web",
+            result=ToolResult(
+                ok=True,
+                output='{"status":200,"count":42,"body":"HTTP 200, 42 rows"}',
+            ),
+        )
+        registry = ToolRegistry()
+        registry.register(
+            tool,
+            ToolSchema("web", "browse", {"type": "object"}),
+        )
+        client = ScriptedModelClient(
+            responses=[
+                tool_call_response("web", {}),
+                text_response(f"FINAL_ANSWER: {answer}"),
+            ]
+        )
+
+        result = SolverEngine(client, registry).solve(
+            make_task(answer_format="numeric")
+        )
+
+        assert result.candidate is not None
+        assert result.candidate.confidence == 0.70
+
+
 def test_grounding_requires_successful_supported_tool_and_nontrivial_answer():
     cases = (
         ("web", ToolResult(ok=False, output="winter dawn", error_code="FAILED"), "winter dawn"),
         ("lookup", ToolResult(ok=True, output="winter dawn"), "winter dawn"),
         ("read_file", ToolResult(ok=True, output="the answer is yes"), "yes"),
+        ("web", ToolResult(ok=True, output='{"answer":"yes"}'), "yes"),
         ("read_file", ToolResult(ok=True, output="wintergreen"), "winter"),
     )
 

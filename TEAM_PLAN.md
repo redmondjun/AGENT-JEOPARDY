@@ -361,6 +361,13 @@ Completed:
 - Added conservative tool-grounded confidence: normal answers supported by a
   successful `web` or `read_file` result receive `0.82`; ungrounded answers
   remain `0.70` and authoritative exact tool values remain `0.95`.
+- Added bounded recovery for locally rejected low-confidence candidates: no
+  server submission or penalty occurs, the candidate is discarded, and the
+  tile gets a fresh solve after cooldown up to the existing three-attempt cap.
+- Added strict short-numeric grounding for web/document results. Values such as
+  `42` can clear the higher-tier gate only beside an explicit
+  `answer`/`result`/`final`/`value` label; HTTP status codes and unrelated page
+  numbers remain ungrounded.
 - Retained the 3.1-second serialized submission interval, strict higher-tier
   gate, and six-worker ceiling after an expected-score and proxy-capacity
   review found no evidence supporting riskier settings.
@@ -370,19 +377,18 @@ Completed:
 Latest validation evidence:
 
 ```text
-200 tests passed, 10 subtests passed in 13.23s
+208 tests passed, 10 subtests passed in 13.32s
 git diff --check: clean
 qualifier result: 5 correct tiles, 1000 points, 0 penalties
 ```
 
-Still pending before the integrated agent can score:
+Live finale gate:
 
-- Sara must provide `solver.build_solver()` and the model tool-use loop.
-- Jun and Vidula must provide their web and runtime tool implementations.
-- CPU-heavy and model-call limits must be enforced inside the respective tool
-  and solver implementations in addition to the generic tile-worker bound.
-- Run the combined agent against the live practice board with the team key.
-- Build and verify the final allowlisted `agent.zip` after all imports merge.
+- Keep the verified revision running until the organizer exposes `boards.main`.
+- Confirm the first wave dispatches six category-diverse tasks and watch
+  structured model/tool/submission diagnostics.
+- Hotfix only a repeated, high-blast-radius failure; otherwise avoid restarting
+  a healthy live agent and losing first-solve time.
 
 ### Deliverables
 

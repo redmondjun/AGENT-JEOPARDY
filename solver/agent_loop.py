@@ -30,6 +30,7 @@ Design decisions worth flagging to the team:
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -53,6 +54,15 @@ GROUNDED_CONFIDENCE = 0.82
 UNGROUNDED_CONFIDENCE = 0.70
 MIN_GROUNDED_ANSWER_ALNUM_CHARS = 5
 GROUNDING_TOOL_NAMES = frozenset({"web", "read_file"})
+_NUMERIC_GROUNDING_PATTERN = (
+    r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
+    r"(?:[eE][-+]?\d+)?%?(?![\w.])"
+)
+_LABELED_NUMERIC_GROUNDING_TOKEN = re.compile(
+    r"(?<!\w)[\"']?(?:answer|result|value|final(?:\s+answer)?)[\"']?"
+    r"\s*[:=]\s*[\"']?(?P<number>" + _NUMERIC_GROUNDING_PATTERN + r")",
+    re.IGNORECASE,
+)
 _CallResult = TypeVar("_CallResult")
 
 
@@ -413,7 +423,11 @@ class SolverEngine:
             )
 
         value = normalize_answer(raw_answer, task.answer_format)
-        grounded = _answer_is_grounded(value, grounding_outputs)
+        grounded = _answer_is_grounded(
+            value,
+            grounding_outputs,
+            answer_format=task.answer_format,
+        )
         return CandidateAnswer(
             value=value,
             confidence=(
@@ -476,15 +490,30 @@ def _truncate(text: str) -> str:
     return text[:EVIDENCE_TRUNCATE_CHARS] + "…[truncated]"
 
 
-def _answer_is_grounded(value: str, outputs: tuple[str, ...]) -> bool:
+def _answer_is_grounded(
+    value: str,
+    outputs: tuple[str, ...],
+    *,
+    answer_format: str,
+) -> bool:
     """Require a non-trivial normalized answer as a whole output token/phrase.
 
-    Case, Unicode presentation, and whitespace differences are harmless, but
-    punctuation is deliberately preserved. Alphanumeric boundaries prevent a
-    candidate such as ``cat`` from being credited merely because an output
-    contains ``category``. Short generic values remain at the conservative
-    ungrounded confidence even if they occur coincidentally in a page.
+    Numeric answers require canonical equality with a token next to an explicit
+    answer/result/final/value label. This keeps short values useful without
+    treating HTTP status codes or unrelated page numbers as evidence. For text,
+    case, Unicode presentation, and whitespace differences are harmless, but
+    punctuation is preserved and short generic values remain conservative.
     """
+    if answer_format == "numeric":
+        # A short number is useful evidence only when the source identifies it
+        # semantically. Bare numbers are ubiquitous in HTTP/HTML output.
+        expected = normalize_answer(value, "numeric")
+        return any(
+            normalize_answer(match.group("number"), "numeric") == expected
+            for output in outputs
+            for match in _LABELED_NUMERIC_GROUNDING_TOKEN.finditer(output)
+        )
+
     answer = _normalize_grounding_text(value)
     if sum(character.isalnum() for character in answer) < (
         MIN_GROUNDED_ANSWER_ALNUM_CHARS
