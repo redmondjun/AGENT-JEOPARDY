@@ -22,11 +22,21 @@ class Calibration:
 
 
 _DEFAULT_PROBABILITY = {100: 0.90, 200: 0.75, 300: 0.55, 400: 0.35, 500: 0.20}
-_DEFAULT_SECONDS = {100: 20.0, 200: 28.0, 300: 38.0, 400: 52.0, 500: 70.0}
+# Practice cleared tier 1 at 7/7 in seconds, while qualifier tier-2 solves
+# took roughly 12-35 seconds. Keep the probability estimate conservative, but
+# use the observed tier-1 latency so the default EPS order harvests fast wins.
+_DEFAULT_SECONDS = {100: 12.0, 200: 28.0, 300: 38.0, 400: 52.0, 500: 70.0}
+_COMPARABLE_SCORE_RATIO = 0.90
 
 
 class PriorityPolicy:
-    """Ranks by expected points per second with deterministic tie-breaking."""
+    """Rank by expected points/second, diversifying only comparable work.
+
+    Tiles within 10% of the best remaining score form a cohort. A cohort is
+    interleaved by category, then by category/points cell, so an initial worker
+    wave does not duplicate one solution strategy when equally valuable work
+    exists. Cohorts never mix, preserving clear expected-value advantages.
+    """
 
     def __init__(
         self,
@@ -61,12 +71,56 @@ class PriorityPolicy:
         )
 
     def rank(self, records: Sequence[TileRecord]) -> list[TileRecord]:
-        return sorted(
+        ranked = sorted(
             records,
-            key=lambda record: (
-                -self.score(record),
-                self.calibration_for(record).expected_seconds,
-                -record.points,
-                record.task_id,
-            ),
+            key=self._base_rank_key,
         )
+        diversified: list[TileRecord] = []
+        start = 0
+        while start < len(ranked):
+            best_score = self.score(ranked[start])
+            end = start + 1
+            while end < len(ranked) and self._is_comparable(
+                best_score, self.score(ranked[end])
+            ):
+                end += 1
+            diversified.extend(self._diversify_cohort(ranked[start:end]))
+            start = end
+        return diversified
+
+    def _base_rank_key(self, record: TileRecord) -> tuple[float, float, int, str]:
+        return (
+            -self.score(record),
+            self.calibration_for(record).expected_seconds,
+            -record.points,
+            record.task_id,
+        )
+
+    @staticmethod
+    def _is_comparable(best_score: float, candidate_score: float) -> bool:
+        if best_score <= 0:
+            return candidate_score == best_score
+        return candidate_score >= best_score * _COMPARABLE_SCORE_RATIO
+
+    @staticmethod
+    def _diversify_cohort(records: Sequence[TileRecord]) -> list[TileRecord]:
+        """Balance category and cell use while retaining base-rank tie breaks."""
+        remaining = list(enumerate(records))
+        category_uses: dict[str, int] = {}
+        cell_uses: dict[tuple[str, int], int] = {}
+        result: list[TileRecord] = []
+        while remaining:
+            index, record = min(
+                remaining,
+                key=lambda item: (
+                    category_uses.get(item[1].category, 0),
+                    cell_uses.get((item[1].category, item[1].points), 0),
+                    item[0],
+                ),
+            )
+            remaining.remove((index, record))
+            result.append(record)
+            category_uses[record.category] = category_uses.get(record.category, 0) + 1
+            cell = (record.category, record.points)
+            cell_uses[cell] = cell_uses.get(cell, 0) + 1
+        return result

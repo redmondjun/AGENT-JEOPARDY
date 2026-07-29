@@ -15,6 +15,10 @@ class WorkerTimedOut(TimeoutError):
     pass
 
 
+class WorkerRetired(RuntimeError):
+    """The tile left the active board while its daemon worker was running."""
+
+
 @dataclass(frozen=True)
 class ScheduledWork(Generic[T]):
     task_id: str
@@ -34,7 +38,13 @@ class BoundedWorkerPool(Generic[T]):
 
     Python cannot safely kill a running thread. At the configured deadline we
     detach that daemon worker, surface WorkerTimedOut to the orchestrator, and
-    free one scheduling slot. Specialist tools must still enforce their own
+    free one scheduling slot. Stale-board workers can be retired the same way
+    so a phase transition does not block the new board.
+
+    Detached threads are quarantined and still counted against a hard
+    ``2 * max_workers`` live-thread ceiling. This gives a new phase one full
+    generation of capacity, but repeated transitions or timeouts cannot create
+    unbounded daemon threads. Specialist tools must still enforce their own
     network/process timeouts; this is the final liveness boundary.
     """
 
@@ -57,16 +67,28 @@ class BoundedWorkerPool(Generic[T]):
         self._counter = 0
         self._lock = threading.RLock()
         self._work: dict[Future[T], _ActiveWork[T]] = {}
+        self._retired: list[_ActiveWork[T]] = []
 
     @property
     def capacity(self) -> int:
         with self._lock:
-            return max(0, self._max_workers - len(self._work))
+            self._reap_retired_locked()
+            active_capacity = self._max_workers - len(self._work)
+            live_capacity = (
+                2 * self._max_workers - len(self._work) - len(self._retired)
+            )
+            return max(0, min(active_capacity, live_capacity))
 
     @property
     def active_count(self) -> int:
         with self._lock:
             return len(self._work)
+
+    @property
+    def retired_count(self) -> int:
+        with self._lock:
+            self._reap_retired_locked()
+            return len(self._retired)
 
     def submit(self, task_id: str, function: Callable[[], T]) -> None:
         with self._lock:
@@ -104,10 +126,34 @@ class BoundedWorkerPool(Generic[T]):
             )
             thread.start()
 
+    def retire_except(self, active_task_ids: set[str]) -> tuple[str, ...]:
+        """Quarantine running work whose tile is no longer on the live board."""
+        retired: list[str] = []
+        with self._lock:
+            self._reap_retired_locked()
+            for future, active in list(self._work.items()):
+                if active.task_id in active_task_ids:
+                    continue
+                if not future.cancel():
+                    try:
+                        future.set_exception(
+                            WorkerRetired(
+                                f"{active.task_id}: tile left the active board"
+                            )
+                        )
+                    except InvalidStateError:
+                        pass  # Worker completed between the checks.
+                del self._work[future]
+                if active.thread.is_alive():
+                    self._retired.append(active)
+                retired.append(active.task_id)
+        return tuple(retired)
+
     def completed(self) -> list[ScheduledWork[T]]:
         now = self._clock()
         done: list[ScheduledWork[T]] = []
         with self._lock:
+            self._reap_retired_locked()
             for future, active in list(self._work.items()):
                 if not future.done() and now - active.started_at >= self._work_timeout_seconds:
                     try:
@@ -121,6 +167,8 @@ class BoundedWorkerPool(Generic[T]):
                         pass  # Worker completed between the checks.
                 if future.done():
                     del self._work[future]
+                    if active.thread.is_alive():
+                        self._retired.append(active)
                     done.append(ScheduledWork(task_id=active.task_id, future=future))
         return done
 
@@ -130,9 +178,13 @@ class BoundedWorkerPool(Generic[T]):
 
     def close(self, *, wait: bool = True) -> None:
         with self._lock:
-            active = list(self._work.values())
+            active = list(self._work.values()) + list(self._retired)
             self._work.clear()
+            self._retired.clear()
         if wait:
             deadline = time.monotonic() + self._work_timeout_seconds
             for work in active:
                 work.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _reap_retired_locked(self) -> None:
+        self._retired = [work for work in self._retired if work.thread.is_alive()]

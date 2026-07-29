@@ -1,7 +1,9 @@
 import time
+from dataclasses import replace
+from pathlib import Path
 
 from contracts import ToolResult
-from solver.agent_loop import SolverEngine, _compact_history
+from solver.agent_loop import SolverEngine, _compact_history, _initial_user_content
 from solver.registry import ToolRegistry, ToolSchema
 from tests.solver.fakes import (
     FakeTool,
@@ -14,6 +16,20 @@ from tests.solver.fakes import (
 
 def _empty_registry() -> ToolRegistry:
     return ToolRegistry()
+
+
+def test_initial_prompt_uses_task_relative_file_paths_for_runtime_tools():
+    workdir = Path("/tmp/jeopardy_task")
+    task = replace(
+        make_task(),
+        workdir=workdir,
+        files=(workdir / "inputs" / "records.csv",),
+    )
+
+    prompt = _initial_user_content(task)
+
+    assert "Attached files:\n- inputs/records.csv" in prompt
+    assert f"- {workdir}/inputs/records.csv" not in prompt
 
 
 def test_history_compaction_keeps_tool_use_and_result_as_an_atomic_pair():
@@ -317,3 +333,36 @@ def test_exact_value_from_tool_bypasses_model_retyping():
     assert result.candidate is not None
     assert result.candidate.value == "3.14159265"
     assert result.candidate.exact_value_from_tool is True
+
+
+def test_exact_value_auto_finalizes_when_model_omits_answer_envelope():
+    tool = FakeTool(
+        "calc",
+        result=ToolResult(
+            ok=True,
+            output="verified computation complete",
+            exact_value="8675309",
+        ),
+    )
+    registry = ToolRegistry()
+    registry.register(tool, ToolSchema("calc", "compute", {"type": "object"}))
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response("calc", {}),
+            text_response("The tool produced the verified result above."),
+        ]
+    )
+    logs: list[str] = []
+    engine = SolverEngine(client, registry, max_turns=5, logger=logs.append)
+
+    result = engine.solve(make_task(answer_format="numeric"))
+
+    assert result.retryable is False
+    assert result.failure_code is None
+    assert result.candidate is not None
+    assert result.candidate.value == "8675309"
+    assert result.candidate.exact_value_from_tool is True
+    assert result.candidate.confidence == 0.95
+    assert "[calc] verified computation complete" in result.candidate.evidence
+    assert "The tool produced the verified result above." in result.candidate.evidence
+    assert any("auto-finalizing tool exact_value" in message for message in logs)

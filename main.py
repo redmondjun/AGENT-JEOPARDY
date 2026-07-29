@@ -21,16 +21,7 @@ from orchestrator import AgentOrchestrator, OrchestratorConfig, SubmissionGate
 from orchestrator.submission_gate import SubmissionPolicy
 
 VERBOSE = os.environ.get("VERBOSE") == "1"
-TASK_FILTER = tuple(
-    task_id.strip()
-    for task_id in os.environ.get("TASK_FILTER", "").split(",")
-    if task_id.strip()
-)
 MAX_TILES_SETTING = os.environ.get("MAX_TILES")
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
-MAX_SOLVE_ATTEMPTS = int(os.environ.get("MAX_SOLVE_ATTEMPTS", "3"))
-POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
-TASK_TIMEOUT_SECONDS = float(os.environ.get("TASK_TIMEOUT_SECONDS", "90"))
 BASELINE_CONFIDENCE = float(os.environ.get("BASELINE_CONFIDENCE", "0"))
 
 # The six category names are part of the event API contract.  Keep the
@@ -161,15 +152,44 @@ def build_solver() -> tuple[TileSolver, bool]:
     return build_team_solver(game=jp, verbose=VERBOSE), True
 
 
-def build_orchestrator(solver: TileSolver, *, max_tiles: int) -> AgentOrchestrator:
-    config = OrchestratorConfig(
-        max_workers=MAX_WORKERS,
-        poll_interval_seconds=POLL_SECONDS,
-        task_timeout_seconds=TASK_TIMEOUT_SECONDS,
-        max_tiles=max_tiles,
-        max_solve_attempts=MAX_SOLVE_ATTEMPTS,
-        task_filter=TASK_FILTER,
+def build_orchestrator_config(
+    *,
+    max_tiles: int,
+    environ: Mapping[str, str] | None = None,
+) -> OrchestratorConfig:
+    """Build throughput settings calibrated for the hosted qualifier.
+
+    Six workers give the I/O-heavy solver more board width than the original
+    four while staying deliberately modest on the two-CPU host and shared
+    95k-token/minute proxy.  The 120-second deadline prevents useful multi-step
+    web/code attempts from being detached at the former 90-second boundary.
+    Every value remains overridable for live rate-limit or latency tuning.
+    """
+    settings = os.environ if environ is None else environ
+    task_filter = tuple(
+        task_id.strip()
+        for task_id in settings.get("TASK_FILTER", "").split(",")
+        if task_id.strip()
     )
+    return OrchestratorConfig(
+        max_workers=int(settings.get("MAX_WORKERS", "6")),
+        poll_interval_seconds=float(settings.get("POLL_SECONDS", "2")),
+        task_timeout_seconds=float(
+            settings.get("TASK_TIMEOUT_SECONDS", "120")
+        ),
+        max_tiles=max_tiles,
+        max_solve_attempts=int(settings.get("MAX_SOLVE_ATTEMPTS", "3")),
+        task_filter=task_filter,
+    )
+
+
+def build_orchestrator(
+    solver: TileSolver,
+    *,
+    max_tiles: int,
+    config: OrchestratorConfig | None = None,
+) -> AgentOrchestrator:
+    resolved_config = config or build_orchestrator_config(max_tiles=max_tiles)
     gate = CompetitionSubmissionGate(
         jp,
         build_submission_policy(),
@@ -178,7 +198,7 @@ def build_orchestrator(solver: TileSolver, *, max_tiles: int) -> AgentOrchestrat
         jp,
         solver,
         gate,
-        config=config,
+        config=resolved_config,
         fatal_error_types=(jp.AuthError,),
     )
 
@@ -188,7 +208,10 @@ def main() -> None:
     max_tiles = int(MAX_TILES_SETTING) if MAX_TILES_SETTING is not None else (
         0 if team_solver_loaded else 3
     )
-    orchestrator = build_orchestrator(solver, max_tiles=max_tiles)
+    config = build_orchestrator_config(max_tiles=max_tiles)
+    orchestrator = build_orchestrator(
+        solver, max_tiles=max_tiles, config=config
+    )
     run_forever_override = os.environ.get("RUN_FOREVER")
     run_forever = (
         team_solver_loaded
@@ -205,7 +228,7 @@ def main() -> None:
         jp.log(
             f"baseline cycle: open={first.open_tiles} dispatched={first.dispatched}"
         )
-        orchestrator.drain_workers(timeout=TASK_TIMEOUT_SECONDS + 5)
+        orchestrator.drain_workers(timeout=config.task_timeout_seconds + 5)
         final = orchestrator.run_cycle()
         jp.log(
             f"baseline complete: completed={final.completed} "

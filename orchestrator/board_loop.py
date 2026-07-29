@@ -94,6 +94,7 @@ class AgentOrchestrator:
         )
         self._fatal_error_types = fatal_error_types
         self._limited_task_ids: set[str] = set()
+        self._phase: str | None = None
         self._closed = False
 
     @property
@@ -104,13 +105,26 @@ class AgentOrchestrator:
         self._ensure_open()
         completed = self._collect_completed()
         board = self._game.board()
+        phase = str(board.get("phase") or "unknown")
         open_tiles = self._game.open_tiles(board)
         discovered = self._tracker.observe_open_tiles(open_tiles)
+        active_ids = {str(tile["id"]) for tile in open_tiles}
+        retired = self._pool.retire_except(active_ids)
+        if retired:
+            self._game.log(
+                f"retired {len(retired)} stale workers: {','.join(retired)}"
+            )
+        if self._phase is not None and phase != self._phase:
+            # MAX_TILES is a per-board sampling limit. A practice selection
+            # must not prevent qualifier/finale ids from being considered.
+            self._limited_task_ids.clear()
+            self._game.log(f"phase changed: {self._phase} -> {phase}")
+        self._phase = phase
         self._tracker.release_submission_cooldowns(now=self._clock())
         submitted = self._process_one_submission()
         dispatched = self._dispatch_available()
         return CycleReport(
-            phase=str(board.get("phase") or "unknown"),
+            phase=phase,
             open_tiles=len(open_tiles),
             discovered=discovered,
             dispatched=dispatched,

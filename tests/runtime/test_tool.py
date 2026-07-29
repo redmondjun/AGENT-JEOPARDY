@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import time
 import zipfile
 from pathlib import Path
@@ -8,7 +9,7 @@ from tools.runtime.errors import INVALID_ARGUMENT, PATH_BLOCKED, PROCESS_FAILED,
 from tools.runtime.tool import (
     ExtractArchiveTool, InspectArchiveTool, ListFilesTool, ReadFileTool,
     RunProcessTool, RunPythonTool, TaskContext, ToolRequest, WriteScratchFileTool,
-    _BaseTool, get_schemas, get_tools,
+    _BaseTool, _MAX_MODEL_READ_BYTES, get_schemas, get_tools,
 )
 
 
@@ -42,6 +43,92 @@ def test_read_file_tool_happy_path(workdir: Path) -> None:
     result = ReadFileTool().execute(_req("read_file", {"path": "a.txt"}), _task(workdir))
     assert result.ok
     assert result.output == "hello"
+
+
+def test_read_file_tool_caps_whole_text_before_model_context(workdir: Path) -> None:
+    (workdir / "large.txt").write_text("x" * (_MAX_MODEL_READ_BYTES * 4))
+
+    result = ReadFileTool().execute(
+        _req("read_file", {"path": "large.txt"}),
+        _task(workdir),
+    )
+
+    assert result.ok
+    assert result.output.startswith("x" * _MAX_MODEL_READ_BYTES)
+    assert "read_file capped at 12000 bytes" in result.output
+    assert len(result.output) < _MAX_MODEL_READ_BYTES + 300
+
+
+def test_read_file_tool_preserves_small_targeted_line_range(workdir: Path) -> None:
+    lines = [f"line-{index}: {'x' * 80}" for index in range(1, 2_001)]
+    (workdir / "large.txt").write_text("\n".join(lines) + "\n")
+
+    result = ReadFileTool().execute(
+        _req(
+            "read_file",
+            {"path": "large.txt", "start_line": 1_337, "end_line": 1_338},
+        ),
+        _task(workdir),
+    )
+
+    assert result.ok
+    assert result.output == f"{lines[1336]}\n{lines[1337]}\n"
+    assert "truncated" not in result.output
+
+
+def test_read_file_tool_caps_large_line_range_with_actionable_marker(
+    workdir: Path,
+) -> None:
+    (workdir / "lines.txt").write_text(
+        "\n".join(f"line-{index}: {'y' * 100}" for index in range(1, 1_001))
+        + "\n"
+    )
+
+    result = ReadFileTool().execute(
+        _req(
+            "read_file",
+            {"path": "lines.txt", "start_line": 1, "end_line": 1_000},
+        ),
+        _task(workdir),
+    )
+
+    assert result.ok
+    assert "line-1:" in result.output
+    assert "line-1000:" not in result.output
+    assert "read_file capped at 12000 bytes" in result.output
+    assert "start_line/end_line" in result.output
+
+
+def test_read_file_tool_caps_binary_before_base64_expansion(workdir: Path) -> None:
+    payload = bytes(range(256)) * 100
+    (workdir / "large.bin").write_bytes(payload)
+
+    result = ReadFileTool().execute(
+        _req("read_file", {"path": "large.bin", "encoding": "binary"}),
+        _task(workdir),
+    )
+
+    assert result.ok
+    encoded, marker = result.output.split("\n...", maxsplit=1)
+    assert base64.b64decode(encoded) == payload[:_MAX_MODEL_READ_BYTES]
+    assert "read_file capped at 12000 bytes" in marker
+
+
+def test_read_file_tool_preserves_targeted_byte_range(workdir: Path) -> None:
+    payload = bytes(range(256)) * 100
+    (workdir / "large.bin").write_bytes(payload)
+
+    result = ReadFileTool().execute(
+        _req(
+            "read_file",
+            {"path": "large.bin", "offset": 15_000, "length": 32},
+        ),
+        _task(workdir),
+    )
+
+    assert result.ok
+    assert base64.b64decode(result.output) == payload[15_000:15_032]
+    assert "truncated" not in result.output
 
 
 def test_read_file_tool_blocks_traversal(workdir: Path) -> None:

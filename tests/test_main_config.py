@@ -137,5 +137,46 @@ class MainSubmissionPolicyTests(unittest.TestCase):
             )
 
 
+class MainOrchestratorConfigTests(unittest.TestCase):
+    def test_qualifier_defaults_use_modest_width_and_longer_deadline(self) -> None:
+        config = main.build_orchestrator_config(max_tiles=0, environ={})
+
+        self.assertEqual(config.max_workers, 6)
+        self.assertEqual(config.task_timeout_seconds, 120.0)
+        self.assertEqual(config.poll_interval_seconds, 2.0)
+        self.assertEqual(config.max_solve_attempts, 3)
+        self.assertEqual(config.max_tiles, 0)
+        self.assertEqual(config.task_filter, ())
+
+    def test_every_orchestration_setting_remains_overridable(self) -> None:
+        config = main.build_orchestrator_config(
+            max_tiles=11,
+            environ={
+                "MAX_WORKERS": "3",
+                "TASK_TIMEOUT_SECONDS": "45.5",
+                "POLL_SECONDS": "0.75",
+                "MAX_SOLVE_ATTEMPTS": "5",
+                "TASK_FILTER": " Q-A1, ,Q-C2,Q-W3 ",
+            },
+        )
+
+        self.assertEqual(config.max_workers, 3)
+        self.assertEqual(config.task_timeout_seconds, 45.5)
+        self.assertEqual(config.poll_interval_seconds, 0.75)
+        self.assertEqual(config.max_solve_attempts, 5)
+        self.assertEqual(config.max_tiles, 11)
+        self.assertEqual(config.task_filter, ("Q-A1", "Q-C2", "Q-W3"))
+
+    def test_invalid_resource_overrides_fail_before_agent_start(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_workers must be positive"):
+            main.build_orchestrator_config(
+                max_tiles=0, environ={"MAX_WORKERS": "0"}
+            )
+        with self.assertRaisesRegex(ValueError, "task timeout must be positive"):
+            main.build_orchestrator_config(
+                max_tiles=0, environ={"TASK_TIMEOUT_SECONDS": "0"}
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

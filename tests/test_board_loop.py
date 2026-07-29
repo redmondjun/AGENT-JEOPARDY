@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -27,10 +28,11 @@ class FakeGame:
         self.responses = list(responses or [])
         self.submit_calls: list[tuple[str, str]] = []
         self.logs: list[str] = []
+        self.phase = "practice"
         self._root = Path(tempfile.mkdtemp(prefix="agent-loop-test-"))
 
     def board(self) -> dict:
-        return {"phase": "practice"}
+        return {"phase": self.phase}
 
     def open_tiles(self, board=None) -> list[dict]:
         return [dict(tile) for tile in self.tiles]
@@ -41,7 +43,7 @@ class FakeGame:
             **tile,
             "prompt": f"solve {task_id}",
             "answer_format": tile.get("answer_format", "exact"),
-            "board": "practice",
+            "board": tile.get("board", "practice"),
             "files": [],
         }
 
@@ -247,6 +249,79 @@ class BoardLoopTests(unittest.TestCase):
         finally:
             agent.close()
 
+    def test_phase_change_retires_blocked_practice_workers_and_dispatches_scored(self) -> None:
+        release_practice = threading.Event()
+        game = FakeGame(
+            [
+                {
+                    "id": "PR-A1",
+                    "category": "A",
+                    "points": 100,
+                    "board": "practice",
+                },
+                {
+                    "id": "PR-B1",
+                    "category": "B",
+                    "points": 100,
+                    "board": "practice",
+                },
+            ]
+        )
+        gate = SubmissionGate(
+            game,
+            SubmissionPolicy(default_minimum_confidence=0.8),
+            clock=self.clock,
+        )
+        agent = AgentOrchestrator(
+            game,
+            PhaseBlockingSolver(release_practice),
+            gate,
+            config=OrchestratorConfig(
+                max_workers=2,
+                max_tiles=2,
+                task_timeout_seconds=30.0,
+            ),
+            clock=self.clock,
+        )
+        try:
+            practice = agent.run_cycle()
+            self.assertEqual(practice.dispatched, 2)
+            self.assertEqual(practice.active_workers, 2)
+
+            game.phase = "round1"
+            game.tiles = [
+                {
+                    "id": "Q-A1",
+                    "category": "A",
+                    "points": 100,
+                    "board": "qual",
+                },
+                {
+                    "id": "Q-B1",
+                    "category": "B",
+                    "points": 100,
+                    "board": "qual",
+                },
+            ]
+            qualifier = agent.run_cycle()
+
+            # No clock advance or 30-second worker deadline is needed: scored
+            # work gets a fresh generation of bounded capacity immediately.
+            self.assertEqual(qualifier.dispatched, 2)
+            self.assertEqual(qualifier.active_workers, 2)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.DEAD
+            )
+            self.assertTrue(
+                any("retired 2 stale workers" in log for log in game.logs)
+            )
+            agent.drain_workers(timeout=1)
+            self.assertEqual(agent.tracker.snapshot("Q-A1").state, TileState.READY)
+            self.assertEqual(agent.tracker.snapshot("Q-B1").state, TileState.READY)
+        finally:
+            release_practice.set()
+            agent.close(wait_for_workers=False)
+
 
 class CountingSolver(AnswerSolver):
     def __init__(self) -> None:
@@ -255,6 +330,17 @@ class CountingSolver(AnswerSolver):
 
     def solve(self, task: TaskContext) -> SolveResult:
         self.calls += 1
+        return super().solve(task)
+
+
+class PhaseBlockingSolver(AnswerSolver):
+    def __init__(self, release_practice: threading.Event) -> None:
+        super().__init__()
+        self.release_practice = release_practice
+
+    def solve(self, task: TaskContext) -> SolveResult:
+        if task.task_id.startswith("PR-"):
+            self.release_practice.wait()
         return super().solve(task)
 
 

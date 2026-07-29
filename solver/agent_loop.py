@@ -239,18 +239,34 @@ class SolverEngine:
             # No tool call this turn — look for the final-answer envelope.
             raw_answer = extract_final_answer(response.text)
             if raw_answer is None:
-                # Model produced neither a tool call nor a final answer.
-                # Rather than loop forever hoping the next turn is
-                # different, treat this as a retryable failure — the
-                # orchestrator can requeue the tile with a fresh worker.
-                self._logger(f"{task.task_id}: solver stopped NO_ACTIONABLE_OUTPUT")
-                return SolveResult(
-                    candidate=None,
-                    retryable=True,
-                    failure_code="NO_ACTIONABLE_OUTPUT",
+                if last_exact_value is None:
+                    # Model produced neither a tool call nor a final answer.
+                    # Rather than loop forever hoping the next turn is
+                    # different, treat this as a retryable failure — the
+                    # orchestrator can requeue the tile with a fresh worker.
+                    self._logger(
+                        f"{task.task_id}: solver stopped NO_ACTIONABLE_OUTPUT"
+                    )
+                    return SolveResult(
+                        candidate=None,
+                        retryable=True,
+                        failure_code="NO_ACTIONABLE_OUTPUT",
+                    )
+
+                # A successful runtime tool's exact_value is already the
+                # authoritative, no-retyping answer channel. Live qualifier
+                # runs showed the model sometimes acknowledged that result in
+                # prose but omitted the FINAL_ANSWER envelope on its next
+                # no-tool turn. Do not discard a proven answer for a formatting
+                # lapse; build and verify the normal exact-tool candidate.
+                raw_answer = last_exact_value
+                self._logger(
+                    f"{task.task_id}: auto-finalizing tool exact_value "
+                    "after missing FINAL_ANSWER envelope"
                 )
 
-            evidence.append(_truncate(response.text))
+            if response.text:
+                evidence.append(_truncate(response.text))
             candidate = self._build_candidate(
                 task=task,
                 raw_answer=raw_answer,
@@ -322,7 +338,15 @@ class SolverEngine:
 
 
 def _initial_user_content(task: TaskContext) -> str:
-    file_lines = "\n".join(f"- {path}" for path in task.files) or "(none)"
+    relative_files: list[str] = []
+    for path in task.files:
+        try:
+            relative_files.append(str(path.relative_to(task.workdir)))
+        except ValueError:
+            # Tool paths are intentionally task-relative. Never encourage the
+            # model to pass an absolute path that the runtime sandbox rejects.
+            relative_files.append(path.name)
+    file_lines = "\n".join(f"- {path}" for path in relative_files) or "(none)"
     return (
         f"Task ID: {task.task_id}\n"
         f"Category: {task.category}\n"

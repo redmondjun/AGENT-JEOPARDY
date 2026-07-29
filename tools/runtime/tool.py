@@ -27,6 +27,15 @@ from tools.runtime.processes import ProcessResult
 
 ANSWER_MARKER = "ANSWER:"
 _MAX_LISTED_MEMBERS = 200
+# A 200 KB read can consume tens of thousands of input tokens once it is
+# echoed into the next model turn. Keep each read comfortably below the
+# solver's 20k cumulative token budget; callers can page with line/byte ranges
+# or use run_python to search without injecting the whole document.
+_MAX_MODEL_READ_BYTES = 12_000
+_READ_TRUNCATION_GUIDANCE = (
+    f"\n...[read_file capped at {_MAX_MODEL_READ_BYTES} bytes; use a smaller "
+    "start_line/end_line range, a byte offset/length, or run_python to search]"
+)
 
 
 # ---------------------------------------------------------------- base
@@ -149,19 +158,45 @@ class ReadFileTool(_BaseTool):
         path = _require_str(arguments, "path")
         if "offset" in arguments or "length" in arguments:
             offset = int(arguments.get("offset", 0))
-            length = int(arguments.get("length", files.DEFAULT_MAX_READ_BYTES))
-            text, _ = files.read_byte_range(task.workdir, path, offset, length)
-            return text, None
+            length = int(arguments.get("length", _MAX_MODEL_READ_BYTES))
+            text, truncated = files.read_byte_range(
+                task.workdir,
+                path,
+                offset,
+                length,
+                max_bytes=_MAX_MODEL_READ_BYTES,
+            )
+            return _with_read_guidance(text, truncated), None
         if "start_line" in arguments or "end_line" in arguments:
             start = int(arguments.get("start_line", 1))
             end = int(arguments.get("end_line", start))
-            text, _ = files.read_line_range(task.workdir, path, start, end)
-            return text, None
+            text, truncated = files.read_line_range(
+                task.workdir,
+                path,
+                start,
+                end,
+                max_bytes=_MAX_MODEL_READ_BYTES,
+            )
+            return _with_read_guidance(text, truncated), None
         if arguments.get("encoding") == "binary":
-            text, _ = files.read_bytes(task.workdir, path)
-            return text, None
-        text, _ = files.read_text(task.workdir, path)
-        return text, None
+            text, truncated = files.read_bytes(
+                task.workdir,
+                path,
+                max_bytes=_MAX_MODEL_READ_BYTES,
+            )
+            return _with_read_guidance(text, truncated), None
+        text, truncated = files.read_text(
+            task.workdir,
+            path,
+            max_bytes=_MAX_MODEL_READ_BYTES,
+        )
+        return _with_read_guidance(text, truncated), None
+
+
+def _with_read_guidance(text: str, truncated: bool) -> str:
+    if not truncated:
+        return text
+    return text + _READ_TRUNCATION_GUIDANCE
 
 
 class WriteScratchFileTool(_BaseTool):
