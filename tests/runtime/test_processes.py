@@ -115,6 +115,16 @@ def test_timeout_kills_descendant_process(workdir: Path, tmp_path: Path) -> None
         except ProcessLookupError:
             dead = True
             break
+        # Minimal containers may not run an init process that promptly reaps
+        # orphaned children. A killed descendant can therefore remain in the
+        # Linux process table as a zombie even though it is no longer running.
+        proc_stat = Path(f"/proc/{child_pid}/stat")
+        try:
+            if proc_stat.read_text().split()[2] == "Z":
+                dead = True
+                break
+        except (FileNotFoundError, IndexError):
+            pass
         time.sleep(0.1)
     assert dead, "descendant process survived the timeout kill"
 

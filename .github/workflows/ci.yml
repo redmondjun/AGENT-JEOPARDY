@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  HOSTED_PYTHON_PACKAGES: anthropic httpx requests beautifulsoup4 lxml numpy pandas
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -16,6 +19,9 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # The event runner preinstalls these packages, but python:3.12-slim
+          # does not. Install them explicitly so CI matches the hosted image.
+          pip install --no-cache-dir $HOSTED_PYTHON_PACKAGES
           pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
       - name: Compile check (syntax gate for every module)
@@ -30,6 +36,13 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install release tools
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends zip unzip
+          rm -rf /var/lib/apt/lists/*
+          pip install --no-cache-dir $HOSTED_PYTHON_PACKAGES
 
       - name: Build agent.zip
         run: bash scripts/build_agent.sh
