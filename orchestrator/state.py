@@ -237,6 +237,33 @@ class TileTracker:
     def fail(self, task_id: str, error: str) -> TileRecord:
         return self.transition(task_id, TileState.FAILED, error=error)
 
+    def revive_failed(self, task_id: str) -> TileRecord | None:
+        """Give a FAILED tile a fresh solve budget.
+
+        FAILED stays terminal for every generic transition; only this explicit
+        idle-capacity path may resurrect a tile. Wrong-answer history and
+        rejected answers survive so a revived tile can never resubmit an
+        already penalized answer.
+        """
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is None or record.state != TileState.FAILED:
+                return None
+            record.state = TileState.DISCOVERED
+            record.solve_attempts = 0
+            record.candidate = None
+            record.last_error = "REVIVED_AFTER_IDLE"
+            record.updated_at = self._clock()
+            return replace(record)
+
+    def failed_task_ids(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(
+                record.task_id
+                for record in self._records.values()
+                if record.state == TileState.FAILED
+            )
+
     def force_dead(self, task_id: str, reason: str) -> TileRecord:
         with self._lock:
             record = self._require(task_id)

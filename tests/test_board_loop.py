@@ -182,8 +182,18 @@ class BoardLoopTests(unittest.TestCase):
             self.assertEqual(solver.calls, 3)
             self.assertEqual(game.submit_calls, [])
             self.clock.advance(5.0)
-            self.assertEqual(agent.run_cycle().dispatched, 0)
-            self.assertEqual(solver.calls, 3)
+            revival = agent.run_cycle()
+            self.assertEqual(revival.dispatched, 1)
+            self.assertTrue(
+                any("event=revive task=PR-A1" in log for log in game.logs)
+            )
+            agent.drain_workers(timeout=1)
+            agent.run_cycle()
+            self.assertEqual(solver.calls, 4)
+            self.assertEqual(game.submit_calls, [])
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.COOLDOWN
+            )
             self.assertTrue(
                 any(
                     "event=submission task=PR-A1 action=retry" in log
@@ -234,6 +244,36 @@ class BoardLoopTests(unittest.TestCase):
             self.assertEqual(agent.tracker.snapshot("Q-A2").state, TileState.SOLVED)
             self.assertEqual(solver.calls, 2)
             self.assertEqual(game.submit_calls, [("Q-A2", "answer-Q-A2")])
+        finally:
+            agent.close()
+
+    def test_failed_tile_revives_when_idle_and_recovers(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}],
+            [{"result": "correct"}],
+        )
+        solver = ConfidenceSequenceSolver((0.2, 0.2, 0.2, 0.95))
+        agent = make_orchestrator(game, solver, self.clock)
+        try:
+            for _ in range(3):
+                agent.run_cycle()
+                agent.drain_workers(timeout=1)
+                agent.run_cycle()
+                self.clock.advance(5.0)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.FAILED
+            )
+
+            self.assertEqual(agent.run_cycle().dispatched, 1)
+            agent.drain_workers(timeout=1)
+            final = agent.run_cycle()
+
+            self.assertEqual(final.submitted, 1)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.SOLVED
+            )
+            self.assertEqual(solver.calls, 4)
+            self.assertEqual(game.submit_calls, [("PR-A1", "answer-PR-A1")])
         finally:
             agent.close()
 

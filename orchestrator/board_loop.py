@@ -128,6 +128,8 @@ class AgentOrchestrator:
         self._tracker.release_submission_cooldowns(now=self._clock())
         submitted = self._process_one_submission()
         dispatched = self._dispatch_available()
+        if dispatched == 0 and self._revive_failed_if_idle(active_ids):
+            dispatched = self._dispatch_available()
         return CycleReport(
             phase=phase,
             open_tiles=len(open_tiles),
@@ -257,6 +259,50 @@ class AgentOrchestrator:
                 f"evidence_count={len(solve.candidate.evidence)}"
             )
         return count
+
+    def _revive_failed_if_idle(self, open_task_ids: set[str]) -> int:
+        """Resurrect attempt-exhausted tiles when workers would otherwise idle.
+
+        Idle workers late in a scored round are donated points: a tile that
+        burned its solve budget is still worth another shot when nothing else
+        is dispatchable, no worker is active, and no verified candidate is
+        waiting. Only tiles still open on the live board are revived, at most
+        one worker-pool's width per cycle, and only in unrestricted runs so
+        MAX_TILES/TASK_FILTER sampling stays deterministic.
+        """
+        if self._config.task_filter or self._config.max_tiles:
+            return 0
+        if self._pool.active_count > 0 or self._tracker.ready():
+            return 0
+        if self._tracker.available(now=self._clock()):
+            return 0
+        revivable = self._tracker.failed_task_ids() & open_task_ids
+        if not revivable:
+            return 0
+        now = self._clock()
+        rested = [
+            record
+            for record in (
+                self._tracker.snapshot(task_id) for task_id in sorted(revivable)
+            )
+            # A freshly failed tile rests one retry interval before revival so
+            # an instantly failing solver cannot hot-loop on the same tile.
+            if now - record.updated_at >= self._config.solve_retry_seconds
+        ]
+        if not rested:
+            return 0
+        ranked = self._priority.rank(rested)
+        revived = 0
+        for record in ranked[: self._pool.capacity]:
+            if self._tracker.revive_failed(record.task_id) is None:
+                continue
+            self._game.log(
+                f"event=revive task={record.task_id} reason=idle_capacity "
+                f"category={record.category!r} points={record.points} "
+                f"wrong_attempts={record.wrong_attempts}"
+            )
+            revived += 1
+        return revived
 
     def _dispatch_available(self) -> int:
         capacity = self._pool.capacity
