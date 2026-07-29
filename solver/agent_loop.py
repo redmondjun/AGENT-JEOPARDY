@@ -31,6 +31,7 @@ Design decisions worth flagging to the team:
 from __future__ import annotations
 
 import time
+import unicodedata
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Thread
@@ -48,6 +49,10 @@ MAX_TOKENS_PER_CALL = 4096  # hard cap per starter guide, section 1
 MAX_HISTORY_MESSAGES = 12
 TOOL_TIMEOUT_SECONDS_DEFAULT = 20.0
 EVIDENCE_TRUNCATE_CHARS = 300
+GROUNDED_CONFIDENCE = 0.82
+UNGROUNDED_CONFIDENCE = 0.70
+MIN_GROUNDED_ANSWER_ALNUM_CHARS = 5
+GROUNDING_TOOL_NAMES = frozenset({"web", "read_file"})
 _CallResult = TypeVar("_CallResult")
 
 
@@ -118,6 +123,7 @@ class SolverEngine:
         tools_schema = self._registry.schemas_for_api()
 
         evidence: list[str] = []
+        grounding_outputs: list[str] = []
         last_exact_value: str | None = None
         total_tokens = 0
 
@@ -186,7 +192,16 @@ class SolverEngine:
                 f"token_limit={self._max_total_tokens} elapsed_ms={model_elapsed_ms} "
                 f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
             )
-            if total_tokens > self._max_total_tokens:
+            over_token_budget = total_tokens > self._max_total_tokens
+            response_final_answer = (
+                None
+                if response.tool_calls
+                else extract_final_answer(response.text)
+            )
+            if over_token_budget and (
+                response.tool_calls
+                or (response_final_answer is None and last_exact_value is None)
+            ):
                 self._log_stop(
                     task,
                     reason="TOKEN_BUDGET_EXHAUSTED",
@@ -265,6 +280,8 @@ class SolverEngine:
                         f"path_kind={_path_kind(call.arguments)}"
                     )
                     evidence.append(_truncate(f"[{call.name}] {result.output}"))
+                    if result.ok and call.name in GROUNDING_TOOL_NAMES:
+                        grounding_outputs.append(result.output)
                     if result.ok and result.exact_value is not None:
                         last_exact_value = result.exact_value
 
@@ -276,7 +293,7 @@ class SolverEngine:
                 continue
 
             # No tool call this turn — look for the final-answer envelope.
-            raw_answer = extract_final_answer(response.text)
+            raw_answer = response_final_answer
             if raw_answer is None:
                 if last_exact_value is None:
                     # Model produced neither a tool call nor a final answer.
@@ -315,6 +332,7 @@ class SolverEngine:
                 raw_answer=raw_answer,
                 last_exact_value=last_exact_value,
                 evidence=tuple(evidence),
+                grounding_outputs=tuple(grounding_outputs),
             )
             outcome = verify_candidate(candidate, task)
             if not outcome.passed:
@@ -383,6 +401,7 @@ class SolverEngine:
         raw_answer: str,
         last_exact_value: str | None,
         evidence: tuple[str, ...],
+        grounding_outputs: tuple[str, ...],
     ) -> CandidateAnswer:
         if last_exact_value is not None:
             return CandidateAnswer(
@@ -394,9 +413,12 @@ class SolverEngine:
             )
 
         value = normalize_answer(raw_answer, task.answer_format)
+        grounded = _answer_is_grounded(value, grounding_outputs)
         return CandidateAnswer(
             value=value,
-            confidence=0.7,
+            confidence=(
+                GROUNDED_CONFIDENCE if grounded else UNGROUNDED_CONFIDENCE
+            ),
             evidence=evidence,
             strategy=task.category,
             exact_value_from_tool=False,
@@ -452,6 +474,44 @@ def _truncate(text: str) -> str:
     if len(text) <= EVIDENCE_TRUNCATE_CHARS:
         return text
     return text[:EVIDENCE_TRUNCATE_CHARS] + "…[truncated]"
+
+
+def _answer_is_grounded(value: str, outputs: tuple[str, ...]) -> bool:
+    """Require a non-trivial normalized answer as a whole output token/phrase.
+
+    Case, Unicode presentation, and whitespace differences are harmless, but
+    punctuation is deliberately preserved. Alphanumeric boundaries prevent a
+    candidate such as ``cat`` from being credited merely because an output
+    contains ``category``. Short generic values remain at the conservative
+    ungrounded confidence even if they occur coincidentally in a page.
+    """
+    answer = _normalize_grounding_text(value)
+    if sum(character.isalnum() for character in answer) < (
+        MIN_GROUNDED_ANSWER_ALNUM_CHARS
+    ):
+        return False
+
+    for output in outputs:
+        haystack = _normalize_grounding_text(output)
+        start = 0
+        while True:
+            match = haystack.find(answer, start)
+            if match < 0:
+                break
+            before = haystack[match - 1] if match > 0 else ""
+            end = match + len(answer)
+            after = haystack[end] if end < len(haystack) else ""
+            if (not before or not before.isalnum()) and (
+                not after or not after.isalnum()
+            ):
+                return True
+            start = match + 1
+    return False
+
+
+def _normalize_grounding_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(normalized.split())
 
 
 def _call_before_deadline(

@@ -340,6 +340,41 @@ OK
 git diff --check: clean
 ```
 
+### Finale hardening update from Nandh — 2026-07-29
+
+Status: **Integrated, fully tested, and staged for pre-finale deployment.**
+
+Completed:
+
+- Increased bounded concurrency to six category-diverse workers and tuned
+  expected-points-per-second ordering so the opening wave covers one fast tile
+  from every category instead of clustering workers on one column.
+- Added phase-change worker quarantine so stale practice or qualifier work
+  cannot consume finale capacity or submit after its board closes.
+- Added hard model/tool deadline boundaries, retryable typed failures, and
+  task-relative file prompts to prevent hung calls and rejected absolute paths.
+- Bounded document reads to preserve model context and added authoritative
+  exact-value auto-finalization when the model omits the answer envelope.
+- Preserved a valid final answer that arrives on the response crossing the
+  token budget; the spent response now passes through the normal verifier
+  instead of being discarded.
+- Added conservative tool-grounded confidence: normal answers supported by a
+  successful `web` or `read_file` result receive `0.82`; ungrounded answers
+  remain `0.70` and authoritative exact tool values remain `0.95`.
+- Retained the 3.1-second serialized submission interval, strict higher-tier
+  gate, and six-worker ceiling after an expected-score and proxy-capacity
+  review found no evidence supporting riskier settings.
+- Added secret-safe lifecycle, dispatch, tool, candidate, and submission logs
+  for rapid live-round diagnosis.
+
+Latest validation evidence:
+
+```text
+200 tests passed, 10 subtests passed in 13.23s
+git diff --check: clean
+qualifier result: 5 correct tiles, 1000 points, 0 penalties
+```
+
 Still pending before the integrated agent can score:
 
 - Sara must provide `solver.build_solver()` and the model tool-use loop.

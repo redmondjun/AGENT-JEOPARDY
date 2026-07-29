@@ -205,7 +205,7 @@ def test_token_budget_exhaustion_is_typed_and_retryable():
 def test_model_and_budget_logs_include_cumulative_diagnostics():
     logs: list[str] = []
     client = ScriptedModelClient(
-        responses=[text_response("FINAL_ANSWER: do-not-log-me", tokens=8_000)]
+        responses=[text_response("do-not-log-me", tokens=8_000)]
     )
     engine = SolverEngine(
         client,
@@ -268,6 +268,47 @@ def test_tool_logs_include_safe_structure_but_not_values_or_output():
     assert output not in combined
     assert "/private/data.txt" not in combined
     assert "hidden-answer" not in combined
+
+
+def test_over_budget_same_response_final_answer_is_preserved():
+    client = ScriptedModelClient(
+        responses=[text_response("FINAL_ANSWER: recovered", tokens=10_000)]
+    )
+    engine = SolverEngine(
+        client,
+        _empty_registry(),
+        max_total_tokens=15_000,
+    )
+
+    result = engine.solve(make_task(answer_format="literal"))
+
+    assert result.candidate is not None
+    assert result.candidate.value == "recovered"
+    assert result.candidate.confidence == 0.70
+    assert result.retryable is False
+
+
+def test_over_budget_prose_preserves_prior_exact_value():
+    tool = FakeTool(
+        "calc",
+        result=ToolResult(ok=True, output="done", exact_value="12345"),
+    )
+    registry = ToolRegistry()
+    registry.register(tool, ToolSchema("calc", "compute", {"type": "object"}))
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response("calc", {}),
+            text_response("The exact result is above.", tokens=10_000),
+        ]
+    )
+    engine = SolverEngine(client, registry, max_total_tokens=15_000)
+
+    result = engine.solve(make_task(answer_format="numeric"))
+
+    assert result.candidate is not None
+    assert result.candidate.value == "12345"
+    assert result.candidate.confidence == 0.95
+    assert result.candidate.exact_value_from_tool is True
 
 
 def test_deadline_exceeded_before_first_turn_is_typed_and_retryable():
@@ -434,3 +475,56 @@ def test_exact_value_auto_finalizes_when_model_omits_answer_envelope():
     assert "[calc] verified computation complete" in result.candidate.evidence
     assert "The tool produced the verified result above." in result.candidate.evidence
     assert any("auto-finalizing tool exact_value" in message for message in logs)
+
+
+def test_successful_web_output_grounds_normalized_final_answer():
+    tool = FakeTool(
+        "web",
+        result=ToolResult(ok=True, output='{"answer":"WINTER   DAWN"}'),
+    )
+    registry = ToolRegistry()
+    registry.register(tool, ToolSchema("web", "browse", {"type": "object"}))
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response("web", {}),
+            text_response("FINAL_ANSWER: Winter Dawn"),
+        ]
+    )
+    engine = SolverEngine(client, registry)
+
+    result = engine.solve(make_task(answer_format="literal"))
+
+    assert result.candidate is not None
+    assert result.candidate.value == "Winter Dawn"
+    assert result.candidate.confidence == 0.82
+    assert result.candidate.exact_value_from_tool is False
+
+
+def test_grounding_requires_successful_supported_tool_and_nontrivial_answer():
+    cases = (
+        ("web", ToolResult(ok=False, output="winter dawn", error_code="FAILED"), "winter dawn"),
+        ("lookup", ToolResult(ok=True, output="winter dawn"), "winter dawn"),
+        ("read_file", ToolResult(ok=True, output="the answer is yes"), "yes"),
+        ("read_file", ToolResult(ok=True, output="wintergreen"), "winter"),
+    )
+
+    for tool_name, tool_result, answer in cases:
+        tool = FakeTool(tool_name, result=tool_result)
+        registry = ToolRegistry()
+        registry.register(
+            tool,
+            ToolSchema(tool_name, "test", {"type": "object"}),
+        )
+        client = ScriptedModelClient(
+            responses=[
+                tool_call_response(tool_name, {}),
+                text_response(f"FINAL_ANSWER: {answer}"),
+            ]
+        )
+
+        result = SolverEngine(client, registry).solve(
+            make_task(answer_format="literal")
+        )
+
+        assert result.candidate is not None
+        assert result.candidate.confidence == 0.70
