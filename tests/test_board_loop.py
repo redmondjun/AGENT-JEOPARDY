@@ -7,7 +7,7 @@ from pathlib import Path
 
 from contracts import CandidateAnswer, SolveResult, TaskContext
 from orchestrator.board_loop import AgentOrchestrator, CycleReport, OrchestratorConfig
-from orchestrator.state import TileState
+from orchestrator.state import TileState, TileTracker
 from orchestrator.submission_gate import SubmissionGate, SubmissionPolicy
 
 
@@ -276,6 +276,105 @@ class BoardLoopTests(unittest.TestCase):
             self.assertEqual(game.submit_calls, [("PR-A1", "answer-PR-A1")])
         finally:
             agent.close()
+
+    def test_failed_tile_does_not_hot_loop_before_revival_rest_expires(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}]
+        )
+        tracker = failed_tracker(game, self.clock)
+        agent = tracked_orchestrator(game, tracker, self.clock)
+        try:
+            self.assertEqual(agent.run_cycle().dispatched, 0)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.FAILED
+            )
+
+            self.clock.advance(4.999)
+            self.assertEqual(agent.run_cycle().dispatched, 0)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.FAILED
+            )
+
+            self.clock.advance(0.001)
+            self.assertEqual(agent.run_cycle().dispatched, 1)
+            revived = agent.tracker.snapshot("PR-A1")
+            self.assertEqual(revived.solve_attempts, 1)
+        finally:
+            agent.close()
+
+    def test_failed_tile_revives_only_when_no_active_ready_or_available_work(
+        self,
+    ) -> None:
+        game = FakeGame(
+            [
+                {"id": "PR-A1", "category": "A", "points": 100},
+                {"id": "PR-B1", "category": "B", "points": 100},
+            ]
+        )
+        tracker = failed_tracker(game, self.clock, task_id="PR-A1")
+        self.clock.advance(5.0)
+        agent = tracked_orchestrator(game, tracker, self.clock)
+        blocker = threading.Event()
+        try:
+            # PR-B1 is still DISCOVERED, so ordinary available work wins.
+            self.assertEqual(
+                agent._revive_failed_if_idle({"PR-A1", "PR-B1"}), 0
+            )
+
+            self.assertIsNotNone(tracker.try_claim_for_fetch("PR-B1"))
+            tracker.transition("PR-B1", TileState.SOLVING)
+            tracker.transition("PR-B1", TileState.VERIFYING)
+            tracker.mark_ready(
+                "PR-B1",
+                CandidateAnswer("ready", 0.95, ("evidence",), "test"),
+                "exact",
+                "practice",
+            )
+            self.assertEqual(
+                agent._revive_failed_if_idle({"PR-A1", "PR-B1"}), 0
+            )
+
+            tracker.force_dead("PR-B1", "test cleanup")
+            agent._pool.submit("active-test", lambda: blocker.wait())
+            self.assertEqual(agent._revive_failed_if_idle({"PR-A1"}), 0)
+
+            blocker.set()
+            for future in agent._pool.futures():
+                future.result(timeout=1)
+            agent._pool.completed()
+            self.assertEqual(agent._revive_failed_if_idle({"PR-A1"}), 1)
+            revived = tracker.snapshot("PR-A1")
+            self.assertEqual(revived.state, TileState.DISCOVERED)
+            self.assertEqual(revived.solve_attempts, 0)
+        finally:
+            blocker.set()
+            agent.close(wait_for_workers=False)
+
+    def test_idle_revival_is_disabled_by_sampling_constraints(self) -> None:
+        cases = (
+            ("max_tiles", {"max_tiles": 1}),
+            ("task_filter", {"task_filter": ("PR-A1",)}),
+        )
+        for name, overrides in cases:
+            with self.subTest(constraint=name):
+                game = FakeGame(
+                    [{"id": "PR-A1", "category": "A", "points": 100}]
+                )
+                tracker = failed_tracker(game, self.clock)
+                self.clock.advance(5.0)
+                agent = tracked_orchestrator(
+                    game, tracker, self.clock, **overrides
+                )
+                try:
+                    self.assertEqual(agent.run_cycle().dispatched, 0)
+                    self.assertEqual(
+                        tracker.snapshot("PR-A1").state, TileState.FAILED
+                    )
+                    self.assertFalse(
+                        any("event=revive" in log for log in game.logs)
+                    )
+                finally:
+                    agent.close()
 
     def test_tile_claimed_during_low_confidence_cooldown_is_not_retried(self) -> None:
         game = FakeGame(
