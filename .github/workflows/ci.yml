@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Matches the hosted agent image (README "Your agent's environment").
+    container: python:3.12-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+      - name: Compile check (syntax gate for every module)
+        run: python -m compileall -q main.py jeopardy.py tools
+
+      - name: Run tests
+        run: python -m pytest tests -v
+
+  zip-build:
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build agent.zip
+        run: bash scripts/build_agent.sh
+
+      - name: Verify agent.zip
+        run: bash scripts/verify_zip.sh
