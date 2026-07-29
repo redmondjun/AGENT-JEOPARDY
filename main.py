@@ -10,7 +10,9 @@ reach the submission API.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
+from typing import Mapping
 
 import jeopardy as jp
 
@@ -29,11 +31,80 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_SOLVE_ATTEMPTS = int(os.environ.get("MAX_SOLVE_ATTEMPTS", "3"))
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
 TASK_TIMEOUT_SECONDS = float(os.environ.get("TASK_TIMEOUT_SECONDS", "90"))
-MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.80"))
-SUBMISSION_INTERVAL_SECONDS = float(
-    os.environ.get("SUBMISSION_INTERVAL_SECONDS", "3.1")
-)
 BASELINE_CONFIDENCE = float(os.environ.get("BASELINE_CONFIDENCE", "0"))
+
+# The six category names are part of the event API contract.  Keep the
+# tier-one relaxation scoped to known categories so an unexpected category or
+# malformed task cannot silently inherit the more aggressive threshold.
+SCORING_CATEGORIES = (
+    "Needle in the Haystack",
+    "The Dark Web",
+    "Ship It",
+    "Ancient Scrolls",
+    "Cryptic",
+    "Heavy Compute",
+)
+SCORED_BOARDS = frozenset({"qual", "main"})
+
+
+def build_submission_policy(
+    environ: Mapping[str, str] | None = None,
+) -> SubmissionPolicy:
+    """Build the calibrated, environment-configurable submission policy.
+
+    Practice results showed that verified, non-tool tier-one candidates at
+    confidence 0.70 were correct 7/7 times.  A 0.65 threshold therefore lets
+    those candidates compete for 100-point scored tiles without weakening the
+    0.80 threshold for higher tiers.  Deterministic tool outputs are emitted by
+    the solver at confidence 0.95 and remain eligible at every tier.
+
+    ``MIN_CONFIDENCE`` controls the conservative default,
+    ``TIER_ONE_MIN_CONFIDENCE`` controls the calibrated tier-one threshold,
+    and ``TIER_ONE_POINTS`` can adapt to an event with a different first tier.
+    """
+    settings = os.environ if environ is None else environ
+    default_minimum = float(settings.get("MIN_CONFIDENCE", "0.80"))
+    tier_one_minimum = float(
+        settings.get("TIER_ONE_MIN_CONFIDENCE", "0.65")
+    )
+    tier_one_points = int(settings.get("TIER_ONE_POINTS", "100"))
+    interval = float(settings.get("SUBMISSION_INTERVAL_SECONDS", "3.1"))
+
+    if tier_one_points < 0:
+        raise ValueError("TIER_ONE_POINTS must be non-negative")
+    if tier_one_minimum > default_minimum:
+        raise ValueError(
+            "TIER_ONE_MIN_CONFIDENCE cannot exceed MIN_CONFIDENCE"
+        )
+
+    return SubmissionPolicy(
+        minimum_interval_seconds=interval,
+        default_minimum_confidence=default_minimum,
+        confidence_overrides={
+            (category, tier_one_points): tier_one_minimum
+            for category in SCORING_CATEGORIES
+        },
+    )
+
+
+class CompetitionSubmissionGate(SubmissionGate):
+    """Apply calibrated overrides only to the two scored boards.
+
+    The API reports practice, qualifier, and game tasks as ``practice``,
+    ``qual``, and ``main`` respectively.  Unknown/empty board values use the
+    conservative default too; a partial task response must never opt itself
+    into the lower competitive threshold.
+    """
+
+    def __init__(self, game, policy: SubmissionPolicy) -> None:
+        super().__init__(game, policy)
+        strict_policy = replace(policy, confidence_overrides={})
+        self._strict_validation_gate = SubmissionGate(game, strict_policy)
+
+    def validate(self, record, candidate) -> str | None:
+        if record.board in SCORED_BOARDS:
+            return super().validate(record, candidate)
+        return self._strict_validation_gate.validate(record, candidate)
 
 
 class NaiveBaselineSolver:
@@ -99,12 +170,9 @@ def build_orchestrator(solver: TileSolver, *, max_tiles: int) -> AgentOrchestrat
         max_solve_attempts=MAX_SOLVE_ATTEMPTS,
         task_filter=TASK_FILTER,
     )
-    gate = SubmissionGate(
+    gate = CompetitionSubmissionGate(
         jp,
-        SubmissionPolicy(
-            minimum_interval_seconds=SUBMISSION_INTERVAL_SECONDS,
-            default_minimum_confidence=MIN_CONFIDENCE,
-        ),
+        build_submission_policy(),
     )
     return AgentOrchestrator(
         jp,

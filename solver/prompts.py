@@ -1,12 +1,4 @@
-"""
-Category-aware system prompts.
-
-Each category gets a short, specific prompt rather than one generic prompt,
-because strategy genuinely differs per category (TEAM_PLAN.md section 8,
-deliverable 2). Every prompt ends with the same final-answer envelope
-instruction so answer_parser.py has one stable format to parse regardless
-of category.
-"""
+"""Concise category-aware system prompts for the solver."""
 
 from __future__ import annotations
 
@@ -19,83 +11,83 @@ CATEGORIES = (
     "Heavy Compute",
 )
 
-_FINAL_ANSWER_ENVELOPE = """
-When you are confident in a final answer, respond with exactly one line in
-this form and nothing else on that line:
+_TOOLS = (
+    "list_files, read_file, write_scratch_file, run_python, run_process, "
+    "inspect_archive, extract_archive, web"
+)
 
-FINAL_ANSWER: <answer>
-
-Rules:
-- If a tool call returned an exact_value, copy it into <answer> character
-  for character. Do not retype, reformat, or "clean up" an exact_value.
-- Do not include explanation, units, or punctuation the answer format
-  forbids.
-- If you are not confident, keep working: call another tool or reconsider,
-  do not emit FINAL_ANSWER until you believe the answer is correct.
-""".strip()
-
-_BASE = """
-You are solving one Jeopardy-style tile under a strict turn and token
-budget. You have tools available; use them for anything that benefits from
-real computation, file access, or HTTP rather than guessing from memory.
-Prefer a tool-verified answer over a remembered one whenever a tool can
-check it.
+_BASE = f"""
+Solve one tile quickly and deterministically. Available tool names are exactly:
+{_TOOLS}.
+Call only those names. Prefer the smallest tool output that proves the answer;
+do not guess, repeatedly list files, or read a large file in full.
 """.strip()
 
 _CATEGORY_PROMPTS: dict[str, str] = {
     "Needle in the Haystack": """
-Category: Needle in the Haystack. The prompt or attached files contain a
-large amount of data with one specific fact buried inside. Do not read the
-whole haystack into your own reasoning if a tool can search, filter, or
-grep it. Prefer targeted lookups over broad summarization. State exactly
-which record/row/line supports your answer as evidence.
+Needle in the Haystack workflow:
+1. Use list_files once to locate inputs.
+2. Search/filter large files with run_python; use read_file only for a small
+   targeted file or line range that confirms the match.
+3. Make the final deterministic script print `ANSWER: <exact value>` so
+   run_python returns exact_value. Stop when the requested record is proven.
 """.strip(),
     "The Dark Web": """
-Category: The Dark Web. Solving this requires stateful HTTP: login flows,
-cookies, redirects, and HTML forms. Do not attempt this from memory or by
-guessing URLs — delegate every request to the web tool so cookies and
-sessions are handled correctly. Read tool output carefully for rejected
-logins, redirect loops, or missing form fields before retrying.
+The Dark Web workflow:
+1. Use web with action=request to open the supplied URL; never guess routes.
+2. Follow returned links/forms with web action=request or action=submit_form.
+   The web tool preserves cookies for this tile, including login state.
+3. Check status, URL, semantic fields, and rejection text after each call.
+   Stop as soon as the page proves the exact requested value.
 """.strip(),
     "Ship It": """
-Category: Ship It. This is a code diagnosis/fix task. Do not just describe
-what looks wrong — delegate to the runtime tool to actually run the code
-and its tests. Diagnose from real failing output, make the smallest fix
-that passes, and re-run tests before answering. An answer without a
-passing test run behind it should be treated as unverified.
+Ship It workflow:
+1. Use list_files, then read_file only on likely source/test files.
+2. Reproduce the failure with run_process using an argv array (no shell syntax).
+3. Apply the smallest fix with write_scratch_file or run_python, then rerun the
+   focused test with run_process. Do not answer without a passing check.
+4. If the answer is computed, print `ANSWER: <exact value>` from run_python or
+   run_process so its exact_value is submitted unchanged.
 """.strip(),
     "Ancient Scrolls": """
-Category: Ancient Scrolls. The material is a long document (or set of
-documents). Do not try to hold the whole text in your head — use the
-document tool to chunk, index, and search rather than reading linearly.
-Cite the specific passage your answer comes from.
+Ancient Scrolls workflow:
+1. Use list_files. For archives, call inspect_archive before extract_archive.
+2. Search/index documents with run_python; avoid loading whole documents into
+   the conversation. Confirm only the relevant passage with read_file ranges.
+3. If extraction or computation yields the answer, make run_python print
+   `ANSWER: <exact value>` so exact_value is preserved.
 """.strip(),
     "Cryptic": """
-Category: Cryptic. The prompt likely involves encoded, obfuscated, or
-binary content (ciphers, encodings, archives, unusual file formats).
-Identify the encoding/format first using a tool before attempting to
-decode anything by eye — do not hand-decode base64/hex/rot13 etc. from
-memory when a tool can do it exactly.
+Cryptic workflow:
+1. Use list_files and read_file to identify the artifact. Use inspect_archive
+   before extract_archive; use run_process for format inspection when useful.
+2. Decode/transform with run_python, testing cheap common encodings first and
+   validating the result against the prompt.
+3. The successful script must print `ANSWER: <exact value>` so run_python
+   returns exact_value. Never hand-decode or retype a computed answer.
 """.strip(),
     "Heavy Compute": """
-Category: Heavy Compute. This requires real calculation, simulation, or
-constraint solving that is unsafe to do by mental arithmetic. Delegate
-computation to the runtime tool. After you have a candidate result,
-independently re-derive or re-check it against the stated constraints
-before answering — do not trust a single computation pass.
+Heavy Compute workflow:
+1. Translate the constraints into a bounded run_python program; use
+   write_scratch_file plus run_process only when a reusable program is clearer.
+2. Add an independent assertion/check inside the computation.
+3. Print only the final verified result as `ANSWER: <exact value>` so the
+   runtime exact_value is submitted unchanged. Do not do arithmetic by hand.
 """.strip(),
 }
 
+_FINAL_ANSWER_ENVELOPE = """
+For a text-only result, finish with exactly `FINAL_ANSWER: <answer>` on one
+line. When run_python or run_process returns exact_value from an `ANSWER:`
+line, do not retype or reformat it; that exact_value is authoritative. If the
+answer is not yet proven, call the next useful tool instead of answering.
+""".strip()
+
 
 def get_system_prompt(category: str) -> str:
-    """
-    Returns the full system prompt for a category. Unknown categories fall
-    back to the base prompt plus the envelope rather than raising — a
-    malformed/unexpected category string must degrade gracefully, not
-    crash the solve.
-    """
-    category_block = _CATEGORY_PROMPTS.get(category, "")
+    """Return a bounded prompt; unknown categories safely use the base rules."""
     parts = [_BASE]
+    category_block = _CATEGORY_PROMPTS.get(category)
     if category_block:
         parts.append(category_block)
     parts.append(_FINAL_ANSWER_ENVELOPE)

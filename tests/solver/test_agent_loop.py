@@ -55,6 +55,51 @@ def test_history_compaction_keeps_tool_use_and_result_as_an_atomic_pair():
     assert compacted[2]["content"][0]["type"] == "tool_result"
 
 
+def test_history_compaction_preserves_every_multi_tool_exchange():
+    messages = [{"role": "user", "content": "task"}]
+    for index in range(8):
+        call_ids = (f"call_{index}_a", f"call_{index}_b")
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": call_id, "name": "lookup"}
+                        for call_id in call_ids
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": "ok",
+                        }
+                        for call_id in call_ids
+                    ],
+                },
+            ]
+        )
+
+    compacted = _compact_history(messages)
+
+    assert compacted[0] is messages[0]
+    assert len(compacted) <= 12
+    for assistant, user in zip(compacted[1::2], compacted[2::2]):
+        tool_use_ids = {
+            block["id"]
+            for block in assistant["content"]
+            if block["type"] == "tool_use"
+        }
+        tool_result_ids = {
+            block["tool_use_id"]
+            for block in user["content"]
+            if block["type"] == "tool_result"
+        }
+        assert tool_use_ids == tool_result_ids
+
+
 def test_model_can_request_multiple_tools_over_multiple_turns():
     tool = FakeTool("lookup", result=ToolResult(ok=True, output="row 7: banana"))
     registry = ToolRegistry()
@@ -153,6 +198,100 @@ def test_deadline_exceeded_before_first_turn_is_typed_and_retryable():
     assert result.retryable is True
     assert result.failure_code == "DEADLINE_EXCEEDED"
     assert client.calls == 0  # must not even attempt a model call past deadline
+
+
+def test_blocked_model_call_returns_at_deadline_as_typed_retryable_failure():
+    class BlockingModelClient:
+        def create_turn(self, **_kwargs):
+            time.sleep(1.0)
+            return text_response("FINAL_ANSWER: too late")
+
+    logs: list[str] = []
+    engine = SolverEngine(BlockingModelClient(), _empty_registry(), logger=logs.append)
+    started = time.monotonic()
+
+    result = engine.solve(
+        make_task(deadline_monotonic=time.monotonic() + 0.05)
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert result.candidate is None
+    assert result.retryable is True
+    assert result.failure_code == "MODEL_CALL_TIMEOUT"
+    assert any("failed=MODEL_CALL_TIMEOUT" in message for message in logs)
+
+
+def test_model_api_exception_is_typed_retryable_and_logged_without_message():
+    secret_marker = "SENSITIVE_MARKER_DO_NOT_LOG"
+
+    class ExplodingModelClient:
+        def create_turn(self, **_kwargs):
+            raise RuntimeError(f"Authorization: Bearer {secret_marker}")
+
+    logs: list[str] = []
+    engine = SolverEngine(ExplodingModelClient(), _empty_registry(), logger=logs.append)
+
+    result = engine.solve(make_task())
+
+    assert result.candidate is None
+    assert result.retryable is True
+    assert result.failure_code == "MODEL_API_ERROR"
+    joined_logs = "\n".join(logs)
+    assert "exception=RuntimeError" in joined_logs
+    assert secret_marker not in joined_logs
+    assert "Authorization" not in joined_logs
+
+
+def test_tool_timeout_is_clamped_to_remaining_task_deadline():
+    tool = FakeTool("lookup", result=ToolResult(ok=True, output="found"))
+    registry = ToolRegistry()
+    registry.register(tool, ToolSchema("lookup", "lookup", {"type": "object"}))
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response("lookup", {}),
+            text_response("FINAL_ANSWER: found"),
+        ]
+    )
+    engine = SolverEngine(client, registry, tool_timeout_seconds=20.0)
+
+    result = engine.solve(
+        make_task(deadline_monotonic=time.monotonic() + 2.0)
+    )
+
+    assert result.candidate is not None
+    assert len(tool.calls) == 1
+    assert 0 < tool.calls[0].timeout_seconds <= 2.0
+
+
+def test_blocked_tool_call_returns_at_deadline_as_typed_retryable_failure():
+    class BlockingTool:
+        name = "blocked"
+
+        def execute(self, _request, _task):
+            time.sleep(1.0)
+            return ToolResult(ok=True, output="too late")
+
+    registry = ToolRegistry()
+    registry.register(
+        BlockingTool(),
+        ToolSchema("blocked", "block forever", {"type": "object"}),
+    )
+    client = ScriptedModelClient(
+        responses=[tool_call_response("blocked", {})]
+    )
+    logs: list[str] = []
+    engine = SolverEngine(client, registry, logger=logs.append)
+    started = time.monotonic()
+
+    result = engine.solve(
+        make_task(deadline_monotonic=time.monotonic() + 0.05)
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert result.candidate is None
+    assert result.retryable is True
+    assert result.failure_code == "TOOL_CALL_TIMEOUT"
+    assert any("error=TOOL_CALL_TIMEOUT" in message for message in logs)
 
 
 def test_exact_value_from_tool_bypasses_model_retyping():

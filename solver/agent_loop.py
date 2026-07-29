@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from queue import Empty, Queue
+from threading import Thread
+from typing import Any, Callable, Protocol, TypeVar
 
 from contracts import CandidateAnswer, SolveResult, TaskContext
 from solver.answer_parser import extract_final_answer, normalize_answer
@@ -46,6 +48,11 @@ MAX_TOKENS_PER_CALL = 4096  # hard cap per starter guide, section 1
 MAX_HISTORY_MESSAGES = 12
 TOOL_TIMEOUT_SECONDS_DEFAULT = 20.0
 EVIDENCE_TRUNCATE_CHARS = 300
+_CallResult = TypeVar("_CallResult")
+
+
+class _CallDeadlineExceeded(Exception):
+    """Internal signal used when a blocking dependency outlives the tile."""
 
 
 @dataclass(frozen=True)
@@ -123,12 +130,38 @@ class SolverEngine:
 
             messages = _compact_history(messages)
 
-            response = self._model_client.create_turn(
-                system=system,
-                messages=messages,
-                tools=tools_schema,
-                max_tokens=MAX_TOKENS_PER_CALL,
-            )
+            try:
+                response = _call_before_deadline(
+                    lambda: self._model_client.create_turn(
+                        system=system,
+                        messages=messages,
+                        tools=tools_schema,
+                        max_tokens=MAX_TOKENS_PER_CALL,
+                    ),
+                    task.deadline_monotonic,
+                )
+            except _CallDeadlineExceeded:
+                self._logger(
+                    f"{task.task_id}: model turn={turn_index + 1} "
+                    "failed=MODEL_CALL_TIMEOUT"
+                )
+                return SolveResult(
+                    candidate=None,
+                    retryable=True,
+                    failure_code="MODEL_CALL_TIMEOUT",
+                )
+            except Exception as exc:  # noqa: BLE001 - SDK/network boundary
+                # Exception messages from HTTP clients can contain request URLs,
+                # headers, or response bodies. Log only the exception class.
+                self._logger(
+                    f"{task.task_id}: model turn={turn_index + 1} "
+                    f"failed=MODEL_API_ERROR exception={type(exc).__name__}"
+                )
+                return SolveResult(
+                    candidate=None,
+                    retryable=True,
+                    failure_code="MODEL_API_ERROR",
+                )
             total_tokens += response.input_tokens + response.output_tokens
             self._logger(
                 f"{task.task_id}: model turn={turn_index + 1} "
@@ -148,12 +181,45 @@ class SolverEngine:
             if response.tool_calls:
                 tool_result_blocks = []
                 for call in response.tool_calls:
-                    result = self._registry.dispatch(
-                        call.name,
-                        call.arguments,
+                    remaining_seconds = task.deadline_monotonic - time.monotonic()
+                    if remaining_seconds <= 0:
+                        self._logger(
+                            f"{task.task_id}: solver stopped DEADLINE_EXCEEDED "
+                            f"before_tool={call.name}"
+                        )
+                        return SolveResult(
+                            candidate=None,
+                            retryable=True,
+                            failure_code="DEADLINE_EXCEEDED",
+                        )
+
+                    # A tool must never receive a timeout that extends beyond
+                    # the tile's global deadline. Well-behaved runtime/web
+                    # tools use this value as their own hard I/O boundary.
+                    tool_timeout_seconds = min(
                         self._tool_timeout_seconds,
-                        task,
+                        remaining_seconds,
                     )
+                    try:
+                        result = _call_before_deadline(
+                            lambda: self._registry.dispatch(
+                                call.name,
+                                call.arguments,
+                                tool_timeout_seconds,
+                                task,
+                            ),
+                            task.deadline_monotonic,
+                        )
+                    except _CallDeadlineExceeded:
+                        self._logger(
+                            f"{task.task_id}: tool={call.name} ok=False "
+                            "error=TOOL_CALL_TIMEOUT"
+                        )
+                        return SolveResult(
+                            candidate=None,
+                            retryable=True,
+                            failure_code="TOOL_CALL_TIMEOUT",
+                        )
                     self._logger(
                         f"{task.task_id}: tool={call.name} ok={result.ok} "
                         f"elapsed_ms={result.elapsed_ms} "
@@ -283,6 +349,43 @@ def _truncate(text: str) -> str:
     return text[:EVIDENCE_TRUNCATE_CHARS] + "…[truncated]"
 
 
+def _call_before_deadline(
+    operation: Callable[[], _CallResult],
+    deadline_monotonic: float,
+) -> _CallResult:
+    """Run a blocking call without allowing it to pin a worker forever.
+
+    Python cannot safely kill a blocked thread, so a timed-out SDK call is
+    detached as a daemon. The tile worker still returns at its deadline and
+    the process remains able to exit. Network clients should additionally
+    retain their own transport timeouts.
+    """
+    remaining_seconds = deadline_monotonic - time.monotonic()
+    if remaining_seconds <= 0:
+        raise _CallDeadlineExceeded
+
+    outcome: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            value: Any = operation()
+            item = (True, value)
+        except Exception as exc:  # noqa: BLE001 - transfer to solver thread
+            item = (False, exc)
+        outcome.put(item)
+
+    worker = Thread(target=invoke, name="solver-model-call", daemon=True)
+    worker.start()
+    try:
+        succeeded, value = outcome.get(timeout=remaining_seconds)
+    except Empty as exc:
+        raise _CallDeadlineExceeded from exc
+
+    if succeeded:
+        return value
+    raise value
+
+
 def _compact_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Keeps the original user turn (index 0) plus the most recent
@@ -291,18 +394,28 @@ def _compact_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     if len(messages) <= MAX_HISTORY_MESSAGES:
         return messages
-    head = messages[:1]
-    tail_start = len(messages) - (MAX_HISTORY_MESSAGES - 1)
 
     # Anthropic requires every user tool_result block to immediately follow
-    # the assistant message containing its matching tool_use block. A blind
-    # slice can begin on a tool_result, after which the SDK merges it with the
-    # preserved initial user prompt and the API rejects the whole request.
-    # Keep the preceding assistant turn as an atomic pair, even if that makes
-    # the compacted history one message larger than the soft limit.
-    if tail_start > 1 and _is_tool_result_message(messages[tail_start]):
-        tail_start -= 1
-    return head + messages[tail_start:]
+    # the assistant message containing its matching tool_use block. Remove
+    # complete oldest exchanges until the history fits rather than choosing a
+    # slice boundary and trying to repair it afterward. This also preserves
+    # assistant turns containing multiple tool_use blocks as one unit.
+    compacted = list(messages)
+    while len(compacted) > MAX_HISTORY_MESSAGES:
+        if len(compacted) >= 3 and _is_tool_use_message(compacted[1]):
+            del compacted[1:3]
+        else:
+            del compacted[1]
+    return compacted
+
+
+def _is_tool_use_message(message: dict[str, Any]) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        _block_value(block, "type") == "tool_use" for block in content
+    )
 
 
 def _is_tool_result_message(message: dict[str, Any]) -> bool:
@@ -310,9 +423,15 @@ def _is_tool_result_message(message: dict[str, Any]) -> bool:
         return False
     content = message.get("content")
     return isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") == "tool_result"
-        for block in content
+        _block_value(block, "type") == "tool_result" for block in content
     )
+
+
+def _block_value(block: Any, field: str) -> Any:
+    """Read both test dictionaries and Anthropic SDK content block objects."""
+    if isinstance(block, dict):
+        return block.get(field)
+    return getattr(block, field, None)
 
 
 # ---------------------------------------------------------------------------
