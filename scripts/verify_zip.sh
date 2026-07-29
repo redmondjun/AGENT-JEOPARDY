@@ -53,15 +53,38 @@ if (( UNCOMPRESSED_BYTES > MAX_UNCOMPRESSED_BYTES )); then
 fi
 echo "  [ok] uncompressed size: ${UNCOMPRESSED_BYTES}B (limit ${MAX_UNCOMPRESSED_BYTES}B)"
 
-# 4. No excluded paths made it in.
+# 4. No excluded paths made it in — except a `.env` at the zip root, which is
+#    allowed ONLY if it is byte-identical to the repo's tracked, non-secret
+#    scripts/build_agent.sh source (agent.env). Any other .env (e.g. a
+#    developer's real, gitignored .env with live credentials) still fails
+#    the build outright, whether or not this zip came from build_agent.sh.
 BAD_ENTRIES=$(unzip -l "$ZIP_PATH" | awk '{print $NF}' \
-  | grep -E '(^|/)(\.env|\.git|__pycache__|\.pytest_cache|tests|fixtures)(/|$)|\.log$' || true)
+  | grep -E '(^|/)(\.git|__pycache__|\.pytest_cache|tests|fixtures)(/|$)|\.log$' || true)
 if [[ -n "$BAD_ENTRIES" ]]; then
   echo "ERROR: zip contains excluded paths:" >&2
   echo "$BAD_ENTRIES" >&2
   exit 1
 fi
-echo "  [ok] no .env/.git/caches/tests/logs present"
+
+if unzip -l "$ZIP_PATH" | awk '{print $NF}' | grep -qx '\.env'; then
+  EXPECTED_ENV="$ROOT_DIR/agent.env"
+  if [[ ! -f "$EXPECTED_ENV" ]]; then
+    echo "ERROR: zip contains .env but no tracked agent.env exists to compare against" >&2
+    exit 1
+  fi
+  ACTUAL_ENV="$(mktemp)"
+  unzip -p "$ZIP_PATH" .env > "$ACTUAL_ENV"
+  if ! diff -q "$EXPECTED_ENV" "$ACTUAL_ENV" >/dev/null 2>&1; then
+    echo "ERROR: zip's .env does not match the tracked, reviewed agent.env — refusing to ship an unreviewed .env" >&2
+    rm -f "$ACTUAL_ENV"
+    exit 1
+  fi
+  rm -f "$ACTUAL_ENV"
+  echo "  [ok] .env present and matches tracked agent.env exactly"
+else
+  echo "  [ok] no .env in zip"
+fi
+echo "  [ok] no .git/caches/tests/logs present"
 
 # 5. Credential scan on the actual zip contents (belt-and-suspenders on top
 #    of build_agent.sh's pre-zip scan of the staging dir).
