@@ -35,6 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install release tools
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends zip unzip
+          rm -rf /var/lib/apt/lists/*
+
       - name: Build agent.zip
         run: bash scripts/build_agent.sh
 
