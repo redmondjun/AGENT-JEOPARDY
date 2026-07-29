@@ -96,20 +96,21 @@ python -V                            # sanity-check: 3.12.x
 
 ### 3. Connect to the event
 
-The kit ships a `.env.example`: four shell `export` lines. Nothing auto-loads
-it, so either fill in your two values and `source` it, or skip the file and
-paste the exports straight into your shell — same effect either way:
+The kit ships the shared event host in `.env.example`. The team key must be
+shared privately; never commit it to this public repository. Copy the file,
+paste the key into your local `.env`, and source it before running the agent:
 
 ```bash
-cp .env.example .env      # then edit the two REPLACE_ values, then:
+cp .env.example .env
+# Edit .env and replace team_REPLACE_WITH_YOUR_KEY with the private team key.
 source .env
 ```
 
-You only change the first two lines — the other two are derived automatically:
+The last two values are derived automatically from the first two:
 
 ```bash
 export JEOPARDY_BASE_URL=https://hackathon.gradial.dev  # https, NO port number
-export TEAM_API_KEY=team_xxxxxxxxxxxx                   # your key, from /join
+export TEAM_API_KEY=team_REPLACE_WITH_YOUR_KEY              # share privately
 export ANTHROPIC_BASE_URL=$JEOPARDY_BASE_URL/anthropic
 export ANTHROPIC_API_KEY=$TEAM_API_KEY                  # same key; the proxy accepts it
 ```
