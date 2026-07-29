@@ -16,6 +16,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # The event runner preinstalls these packages, but python:3.12-slim
+          # does not. Install them explicitly so CI matches the hosted image.
+          pip install --no-cache-dir \
+            anthropic httpx requests beautifulsoup4 lxml numpy pandas
           pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
       - name: Compile check (syntax gate for every module)
