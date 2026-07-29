@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import pathlib
 import tempfile
+import threading
 import time
 
 import requests
@@ -28,8 +29,34 @@ if not BASE or not KEY:
         "Set JEOPARDY_BASE_URL and TEAM_API_KEY first (see .env.example).\n"
         "Get them from /join on the event site.")
 
-_s = requests.Session()
-_s.headers["X-Api-Key"] = KEY
+
+# requests.Session is not thread-safe; the orchestrator calls this module from
+# the board-loop thread and every worker thread at once, so each thread gets
+# its own session (connection pool) instead of racing on one shared socket.
+class _ThreadLocalSession:
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers["X-Api-Key"] = KEY
+            self._local.session = session
+        return session
+
+    def get(self, *args, **kwargs):
+        return self._session().get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        return self._session().post(*args, **kwargs)
+
+    @property
+    def headers(self):
+        return self._session().headers
+
+
+_s = _ThreadLocalSession()
 
 
 # ---------------------------------------------------------------- errors
