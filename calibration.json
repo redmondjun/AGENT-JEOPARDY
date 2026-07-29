@@ -1,1 +1,10 @@
-{}
+{
+  "Ancient Scrolls|100": {
+    "attempts": 2,
+    "correct": 2,
+    "durations": [
+      44.15,
+      17.683
+    ]
+  }
+}
