@@ -26,6 +26,7 @@ class SchedulerTests(unittest.TestCase):
         clock.now = 5.0
         completed = pool.completed()
         self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].elapsed_ms, 5000)
         with self.assertRaises(WorkerTimedOut):
             completed[0].future.result()
         self.assertEqual(pool.capacity, 1)

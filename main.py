@@ -180,6 +180,9 @@ def build_orchestrator_config(
         max_tiles=max_tiles,
         max_solve_attempts=int(settings.get("MAX_SOLVE_ATTEMPTS", "3")),
         task_filter=task_filter,
+        heartbeat_interval_seconds=float(
+            settings.get("HEARTBEAT_INTERVAL_SECONDS", "30")
+        ),
     )
 
 
@@ -209,6 +212,18 @@ def main() -> None:
         0 if team_solver_loaded else 3
     )
     config = build_orchestrator_config(max_tiles=max_tiles)
+    policy = build_submission_policy()
+    jp.log(
+        f"event=agent_start workers={config.max_workers} "
+        f"task_timeout_seconds={config.task_timeout_seconds:g} "
+        f"heartbeat_interval_seconds={config.heartbeat_interval_seconds:g} "
+        f"max_solve_attempts={config.max_solve_attempts} "
+        f"min_confidence={policy.default_minimum_confidence:.3f} "
+        f"task_filter_count={len(config.task_filter)} "
+        f"solver_turn_limit={os.environ.get('SOLVER_MAX_TURNS', '8')} "
+        f"solver_token_limit={os.environ.get('SOLVER_MAX_TOTAL_TOKENS', '20000')} "
+        f"tool_timeout_seconds={os.environ.get('TOOL_TIMEOUT_SECONDS', '20')}"
+    )
     orchestrator = build_orchestrator(
         solver, max_tiles=max_tiles, config=config
     )

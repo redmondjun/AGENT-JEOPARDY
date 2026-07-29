@@ -106,8 +106,10 @@ class SolverEngine:
 
     def solve(self, task: TaskContext) -> SolveResult:
         self._logger(
-            f"{task.task_id}: solve start category={task.category!r} "
-            f"points={task.points} files={len(task.files)}"
+            f"event=solve_start task={task.task_id} category={task.category!r} "
+            f"points={task.points} files={len(task.files)} "
+            f"turn_limit={self._max_turns} token_limit={self._max_total_tokens} "
+            f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
         )
         system = get_system_prompt(task.category)
         messages: list[dict[str, Any]] = [
@@ -121,7 +123,12 @@ class SolverEngine:
 
         for turn_index in range(self._max_turns):
             if time.monotonic() >= task.deadline_monotonic:
-                self._logger(f"{task.task_id}: solver stopped DEADLINE_EXCEEDED")
+                self._log_stop(
+                    task,
+                    reason="DEADLINE_EXCEEDED",
+                    turn=turn_index,
+                    total_tokens=total_tokens,
+                )
                 return SolveResult(
                     candidate=None,
                     retryable=True,
@@ -130,6 +137,7 @@ class SolverEngine:
 
             messages = _compact_history(messages)
 
+            model_started = time.monotonic()
             try:
                 response = _call_before_deadline(
                     lambda: self._model_client.create_turn(
@@ -142,8 +150,10 @@ class SolverEngine:
                 )
             except _CallDeadlineExceeded:
                 self._logger(
-                    f"{task.task_id}: model turn={turn_index + 1} "
-                    "failed=MODEL_CALL_TIMEOUT"
+                    f"event=model_error task={task.task_id} turn={turn_index + 1} "
+                    f"reason=MODEL_CALL_TIMEOUT failed=MODEL_CALL_TIMEOUT "
+                    f"elapsed_ms={int((time.monotonic() - model_started) * 1000)} "
+                    f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
                 )
                 return SolveResult(
                     candidate=None,
@@ -154,22 +164,35 @@ class SolverEngine:
                 # Exception messages from HTTP clients can contain request URLs,
                 # headers, or response bodies. Log only the exception class.
                 self._logger(
-                    f"{task.task_id}: model turn={turn_index + 1} "
-                    f"failed=MODEL_API_ERROR exception={type(exc).__name__}"
+                    f"event=model_error task={task.task_id} turn={turn_index + 1} "
+                    f"reason=MODEL_API_ERROR exception={type(exc).__name__} "
+                    f"elapsed_ms={int((time.monotonic() - model_started) * 1000)} "
+                    f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
                 )
                 return SolveResult(
                     candidate=None,
                     retryable=True,
                     failure_code="MODEL_API_ERROR",
                 )
-            total_tokens += response.input_tokens + response.output_tokens
+            model_elapsed_ms = int((time.monotonic() - model_started) * 1000)
+            turn_tokens = response.input_tokens + response.output_tokens
+            total_tokens += turn_tokens
             self._logger(
-                f"{task.task_id}: model turn={turn_index + 1} "
+                f"event=model_turn task={task.task_id} turn={turn_index + 1} "
                 f"tools={','.join(call.name for call in response.tool_calls) or 'none'} "
-                f"tokens={response.input_tokens + response.output_tokens}"
+                f"input_tokens={response.input_tokens} "
+                f"output_tokens={response.output_tokens} "
+                f"turn_tokens={turn_tokens} total_tokens={total_tokens} "
+                f"token_limit={self._max_total_tokens} elapsed_ms={model_elapsed_ms} "
+                f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
             )
             if total_tokens > self._max_total_tokens:
-                self._logger(f"{task.task_id}: solver stopped TOKEN_BUDGET_EXHAUSTED")
+                self._log_stop(
+                    task,
+                    reason="TOKEN_BUDGET_EXHAUSTED",
+                    turn=turn_index + 1,
+                    total_tokens=total_tokens,
+                )
                 return SolveResult(
                     candidate=None,
                     retryable=True,
@@ -180,12 +203,14 @@ class SolverEngine:
 
             if response.tool_calls:
                 tool_result_blocks = []
-                for call in response.tool_calls:
+                for call_index, call in enumerate(response.tool_calls, start=1):
                     remaining_seconds = task.deadline_monotonic - time.monotonic()
                     if remaining_seconds <= 0:
-                        self._logger(
-                            f"{task.task_id}: solver stopped DEADLINE_EXCEEDED "
-                            f"before_tool={call.name}"
+                        self._log_stop(
+                            task,
+                            reason="DEADLINE_EXCEEDED",
+                            turn=turn_index + 1,
+                            total_tokens=total_tokens,
                         )
                         return SolveResult(
                             candidate=None,
@@ -200,6 +225,7 @@ class SolverEngine:
                         self._tool_timeout_seconds,
                         remaining_seconds,
                     )
+                    tool_started = time.monotonic()
                     try:
                         result = _call_before_deadline(
                             lambda: self._registry.dispatch(
@@ -212,8 +238,15 @@ class SolverEngine:
                         )
                     except _CallDeadlineExceeded:
                         self._logger(
-                            f"{task.task_id}: tool={call.name} ok=False "
-                            "error=TOOL_CALL_TIMEOUT"
+                            f"event=tool_result task={task.task_id} "
+                            f"turn={turn_index + 1} "
+                            f"call={call_index}/{len(response.tool_calls)} "
+                            f"tool={call.name} ok=False "
+                            f"elapsed_ms={int((time.monotonic() - tool_started) * 1000)} "
+                            f"error=TOOL_CALL_TIMEOUT output_chars=0 "
+                            f"exact_value=False "
+                            f"arg_keys={_argument_keys(call.arguments)} "
+                            f"path_kind={_path_kind(call.arguments)}"
                         )
                         return SolveResult(
                             candidate=None,
@@ -221,9 +254,15 @@ class SolverEngine:
                             failure_code="TOOL_CALL_TIMEOUT",
                         )
                     self._logger(
-                        f"{task.task_id}: tool={call.name} ok={result.ok} "
+                        f"event=tool_result task={task.task_id} turn={turn_index + 1} "
+                        f"call={call_index}/{len(response.tool_calls)} tool={call.name} "
+                        f"ok={result.ok} "
                         f"elapsed_ms={result.elapsed_ms} "
-                        f"error={result.error_code or 'none'}"
+                        f"error={result.error_code or 'none'} "
+                        f"output_chars={len(result.output)} "
+                        f"exact_value={result.exact_value is not None} "
+                        f"arg_keys={_argument_keys(call.arguments)} "
+                        f"path_kind={_path_kind(call.arguments)}"
                     )
                     evidence.append(_truncate(f"[{call.name}] {result.output}"))
                     if result.ok and result.exact_value is not None:
@@ -244,8 +283,11 @@ class SolverEngine:
                     # Rather than loop forever hoping the next turn is
                     # different, treat this as a retryable failure — the
                     # orchestrator can requeue the tile with a fresh worker.
-                    self._logger(
-                        f"{task.task_id}: solver stopped NO_ACTIONABLE_OUTPUT"
+                    self._log_stop(
+                        task,
+                        reason="NO_ACTIONABLE_OUTPUT",
+                        turn=turn_index + 1,
+                        total_tokens=total_tokens,
                     )
                     return SolveResult(
                         candidate=None,
@@ -261,8 +303,9 @@ class SolverEngine:
                 # lapse; build and verify the normal exact-tool candidate.
                 raw_answer = last_exact_value
                 self._logger(
-                    f"{task.task_id}: auto-finalizing tool exact_value "
-                    "after missing FINAL_ANSWER envelope"
+                    f"event=auto_finalize task={task.task_id} "
+                    f"reason=TOOL_EXACT_VALUE turn={turn_index + 1} "
+                    f"detail='auto-finalizing tool exact_value'"
                 )
 
             if response.text:
@@ -297,17 +340,40 @@ class SolverEngine:
                 )
 
             self._logger(
-                f"{task.task_id}: candidate strategy={candidate.strategy!r} "
+                f"event=candidate task={task.task_id} strategy={candidate.strategy!r} "
                 f"confidence={candidate.confidence:.3f} "
-                f"verified={outcome.passed} exact_tool={candidate.exact_value_from_tool}"
+                f"verified={outcome.passed} exact_tool={candidate.exact_value_from_tool} "
+                f"evidence_count={len(candidate.evidence)} "
+                f"verification_reason_count={len(outcome.reasons)} "
+                f"turn={turn_index + 1} total_tokens={total_tokens}"
             )
             return SolveResult(candidate=candidate, retryable=False)
 
-        self._logger(f"{task.task_id}: solver stopped TURN_BUDGET_EXHAUSTED")
+        self._log_stop(
+            task,
+            reason="TURN_BUDGET_EXHAUSTED",
+            turn=self._max_turns,
+            total_tokens=total_tokens,
+        )
         return SolveResult(
             candidate=None,
             retryable=True,
             failure_code="TURN_BUDGET_EXHAUSTED",
+        )
+
+    def _log_stop(
+        self,
+        task: TaskContext,
+        *,
+        reason: str,
+        turn: int,
+        total_tokens: int,
+    ) -> None:
+        self._logger(
+            f"event=solver_stop task={task.task_id} reason={reason} turn={turn} "
+            f"turn_limit={self._max_turns} total_tokens={total_tokens} "
+            f"token_limit={self._max_total_tokens} "
+            f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
         )
 
     def _build_candidate(
@@ -356,6 +422,21 @@ def _initial_user_content(task: TaskContext) -> str:
         f"Attached files:\n{file_lines}\n\n"
         f"Prompt:\n{task.prompt}"
     )
+
+
+def _remaining_ms(deadline_monotonic: float) -> int:
+    return max(0, int((deadline_monotonic - time.monotonic()) * 1000))
+
+
+def _argument_keys(arguments: dict[str, Any]) -> str:
+    return ",".join(sorted(str(key) for key in arguments)) or "none"
+
+
+def _path_kind(arguments: dict[str, Any]) -> str:
+    path = arguments.get("path")
+    if not isinstance(path, str):
+        return "none"
+    return "absolute" if path.startswith(("/", "\\")) else "relative"
 
 
 def _tool_result_block(tool_use_id: str, output: str, *, is_error: bool) -> dict[str, Any]:

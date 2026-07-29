@@ -23,6 +23,7 @@ class WorkerRetired(RuntimeError):
 class ScheduledWork(Generic[T]):
     task_id: str
     future: Future[T]
+    elapsed_ms: int
 
 
 @dataclass
@@ -169,7 +170,13 @@ class BoundedWorkerPool(Generic[T]):
                     del self._work[future]
                     if active.thread.is_alive():
                         self._retired.append(active)
-                    done.append(ScheduledWork(task_id=active.task_id, future=future))
+                    done.append(
+                        ScheduledWork(
+                            task_id=active.task_id,
+                            future=future,
+                            elapsed_ms=max(0, int((now - active.started_at) * 1000)),
+                        )
+                    )
         return done
 
     def futures(self) -> tuple[Future[T], ...]:

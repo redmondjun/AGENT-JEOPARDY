@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from contracts import CandidateAnswer, SolveResult, TaskContext
-from orchestrator.board_loop import AgentOrchestrator, OrchestratorConfig
+from orchestrator.board_loop import AgentOrchestrator, CycleReport, OrchestratorConfig
 from orchestrator.state import TileState
 from orchestrator.submission_gate import SubmissionGate, SubmissionPolicy
 
@@ -127,6 +127,12 @@ class BoardLoopTests(unittest.TestCase):
             self.assertEqual(second.submitted, 1)
             self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.SOLVED)
             self.assertEqual(game.submit_calls, [("PR-A1", "answer-PR-A1")])
+            combined = "\n".join(game.logs)
+            self.assertIn("event=dispatch task=PR-A1 attempt=1/3", combined)
+            self.assertIn("event=worker_complete task=PR-A1 outcome=ready", combined)
+            self.assertIn("event=submission task=PR-A1 action=attempt", combined)
+            self.assertIn("event=submission task=PR-A1 action=solved", combined)
+            self.assertNotIn("answer-PR-A1", combined)
         finally:
             agent.close()
 
@@ -143,6 +149,14 @@ class BoardLoopTests(unittest.TestCase):
             agent.drain_workers(timeout=1)
             self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.COOLDOWN)
             self.assertEqual(agent.tracker.snapshot("PR-B1").state, TileState.READY)
+            failure_log = next(
+                log
+                for log in game.logs
+                if "event=worker_complete task=PR-A1 outcome=exception" in log
+            )
+            self.assertIn("error_type=RuntimeError", failure_log)
+            self.assertIn("next_attempt=2", failure_log)
+            self.assertNotIn("boom", failure_log)
         finally:
             agent.close()
 
@@ -158,6 +172,13 @@ class BoardLoopTests(unittest.TestCase):
             agent.run_cycle()
             self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.FAILED)
             self.assertEqual(game.submit_calls, [])
+            self.assertTrue(
+                any(
+                    "event=submission task=PR-A1 action=rejected" in log
+                    and "reason=LOW_CONFIDENCE" in log
+                    for log in game.logs
+                )
+            )
         finally:
             agent.close()
 
@@ -246,6 +267,44 @@ class BoardLoopTests(unittest.TestCase):
             agent.run_cycle()
             self.assertEqual(solver.calls, 1)
             self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.SOLVED)
+            self.assertTrue(
+                any(
+                    "event=submission task=PR-A1 action=retry" in log
+                    and "reason=rate_limited" in log
+                    and "preserve_candidate=True" in log
+                    for log in game.logs
+                )
+            )
+        finally:
+            agent.close()
+
+    def test_cycle_log_reports_changes_and_periodic_heartbeat(self) -> None:
+        game = FakeGame([])
+        agent = make_orchestrator(game, AnswerSolver(), self.clock)
+        report = CycleReport(
+            phase="practice",
+            open_tiles=0,
+            discovered=0,
+            dispatched=0,
+            completed=0,
+            submitted=0,
+            active_workers=0,
+        )
+        try:
+            agent._log_cycle(report)
+            agent._log_cycle(report)
+            self.assertEqual(len(game.logs), 1)
+            self.assertIn("event=cycle kind=change", game.logs[0])
+            self.assertIn("states=none", game.logs[0])
+
+            self.clock.advance(29.9)
+            agent._log_cycle(report)
+            self.assertEqual(len(game.logs), 1)
+
+            self.clock.advance(0.1)
+            agent._log_cycle(report)
+            self.assertEqual(len(game.logs), 2)
+            self.assertIn("event=cycle kind=heartbeat", game.logs[1])
         finally:
             agent.close()
 

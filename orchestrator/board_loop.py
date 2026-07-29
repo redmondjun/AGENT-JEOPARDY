@@ -14,7 +14,7 @@ from contracts import GameAPI, SolveResult, TaskContext, TileSolver
 from .priority import PriorityPolicy
 from .scheduler import BoundedWorkerPool
 from .state import InvalidTransition, TERMINAL_STATES, TileRecord, TileState, TileTracker
-from .submission_gate import SubmissionAction, SubmissionGate
+from .submission_gate import SubmissionAction, SubmissionDecision, SubmissionGate
 
 
 class FatalSubmissionError(RuntimeError):
@@ -31,6 +31,7 @@ class OrchestratorConfig:
     max_tiles: int = 0
     max_solve_attempts: int = 3
     task_filter: tuple[str, ...] = ()
+    heartbeat_interval_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.max_workers <= 0:
@@ -47,6 +48,8 @@ class OrchestratorConfig:
             raise ValueError("max_tiles must be non-negative")
         if self.max_solve_attempts <= 0:
             raise ValueError("max_solve_attempts must be positive")
+        if self.heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat interval must be positive")
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,8 @@ class AgentOrchestrator:
         self._limited_task_ids: set[str] = set()
         self._phase: str | None = None
         self._closed = False
+        self._last_cycle_fingerprint: tuple[object, ...] | None = None
+        self._last_cycle_log_at: float | None = None
 
     @property
     def tracker(self) -> TileTracker:
@@ -140,12 +145,7 @@ class AgentOrchestrator:
                 delay = self._config.poll_interval_seconds
                 try:
                     report = self.run_cycle()
-                    self._game.log(
-                        "phase="
-                        f"{report.phase} open={report.open_tiles} "
-                        f"active={report.active_workers} dispatched={report.dispatched} "
-                        f"completed={report.completed} submitted={report.submitted}"
-                    )
+                    self._log_cycle(report)
                     gate_wait = self._gate.seconds_until_available()
                     if self._tracker.ready() and gate_wait > 0:
                         delay = min(delay, gate_wait)
@@ -154,7 +154,10 @@ class AgentOrchestrator:
                 except FatalSubmissionError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - supervisor boundary
-                    self._game.log(f"orchestrator cycle failed: {exc!r}")
+                    self._game.log(
+                        f"event=orchestrator_error error_type={type(exc).__name__} "
+                        f"message_chars={len(str(exc))}"
+                    )
                     delay = self._config.error_backoff_seconds
                 stop.wait(delay)
         finally:
@@ -181,30 +184,63 @@ class AgentOrchestrator:
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate one tile
                 record = self._tracker.snapshot(work.task_id)
-                if record.state not in TERMINAL_STATES:
-                    self._tracker.defer(
-                        work.task_id,
-                        self._config.solve_retry_seconds,
-                        f"WORKER_EXCEPTION:{type(exc).__name__}",
+                if record.state in TERMINAL_STATES:
+                    self._game.log(
+                        f"event=worker_complete task={work.task_id} "
+                        f"outcome=stale_exception elapsed_ms={work.elapsed_ms} "
+                        f"state={record.state.value} error_type={type(exc).__name__}"
                     )
-                self._game.log(f"{work.task_id}: worker failed: {exc!r}")
+                    continue
+                self._tracker.defer(
+                    work.task_id,
+                    self._config.solve_retry_seconds,
+                    f"WORKER_EXCEPTION:{type(exc).__name__}",
+                )
+                updated = self._tracker.snapshot(work.task_id)
+                self._game.log(
+                    f"event=worker_complete task={work.task_id} outcome=exception "
+                    f"elapsed_ms={work.elapsed_ms} error_type={type(exc).__name__} "
+                    f"reason={updated.last_error or type(exc).__name__} "
+                    f"retry_in_seconds={self._config.solve_retry_seconds:g} "
+                    f"next_attempt={updated.solve_attempts + 1}"
+                )
                 continue
 
             record = self._tracker.snapshot(work.task_id)
             if record.state in TERMINAL_STATES:
+                self._game.log(
+                    f"event=worker_complete task={work.task_id} outcome=stale "
+                    f"elapsed_ms={work.elapsed_ms} state={record.state.value}"
+                )
                 continue
             solve = result.solve_result
             if solve.candidate is None:
                 if solve.retryable:
-                    self._tracker.defer(
-                        work.task_id,
+                    retry_delay = (
                         solve.retry_after_seconds
                         if solve.retry_after_seconds is not None
-                        else self._config.solve_retry_seconds,
+                        else self._config.solve_retry_seconds
+                    )
+                    self._tracker.defer(
+                        work.task_id,
+                        retry_delay,
                         solve.failure_code or "SOLVE_FAILED",
+                    )
+                    self._game.log(
+                        f"event=worker_complete task={work.task_id} outcome=retry "
+                        f"elapsed_ms={work.elapsed_ms} "
+                        f"reason={solve.failure_code or 'SOLVE_FAILED'} "
+                        f"retry_in_seconds={retry_delay:g} preserve_candidate=False "
+                        f"next_attempt={record.solve_attempts + 1}"
                     )
                 else:
                     self._tracker.fail(work.task_id, solve.failure_code or "SOLVE_FAILED")
+                    self._game.log(
+                        f"event=worker_complete task={work.task_id} outcome=failed "
+                        f"elapsed_ms={work.elapsed_ms} "
+                        f"reason={solve.failure_code or 'SOLVE_FAILED'} "
+                        f"attempt={record.solve_attempts}"
+                    )
                 continue
 
             self._tracker.transition(work.task_id, TileState.VERIFYING)
@@ -213,6 +249,12 @@ class AgentOrchestrator:
                 solve.candidate,
                 result.answer_format,
                 result.board,
+            )
+            self._game.log(
+                f"event=worker_complete task={work.task_id} outcome=ready "
+                f"elapsed_ms={work.elapsed_ms} attempt={record.solve_attempts} "
+                f"confidence={solve.candidate.confidence:.3f} "
+                f"evidence_count={len(solve.candidate.evidence)}"
             )
         return count
 
@@ -237,6 +279,11 @@ class AgentOrchestrator:
         for record in ranked[:capacity]:
             if record.solve_attempts >= self._config.max_solve_attempts:
                 self._tracker.fail(record.task_id, "SOLVE_ATTEMPTS_EXHAUSTED")
+                self._game.log(
+                    f"event=dispatch task={record.task_id} outcome=failed "
+                    f"reason=SOLVE_ATTEMPTS_EXHAUSTED "
+                    f"attempts={record.solve_attempts}/{self._config.max_solve_attempts}"
+                )
                 continue
             claimed = self._tracker.try_claim_for_fetch(
                 record.task_id, now=self._clock()
@@ -246,6 +293,12 @@ class AgentOrchestrator:
             self._pool.submit(
                 record.task_id,
                 lambda task_id=record.task_id: self._solve_one(task_id),
+            )
+            self._game.log(
+                f"event=dispatch task={record.task_id} "
+                f"attempt={claimed.solve_attempts}/{self._config.max_solve_attempts} "
+                f"category={record.category!r} points={record.points} "
+                f"worker_timeout_seconds={self._config.task_timeout_seconds:g}"
             )
             dispatched += 1
         return dispatched
@@ -298,13 +351,24 @@ class AgentOrchestrator:
             validation_error = self._gate.validate(record, candidate)
             if validation_error:
                 self._tracker.fail(record.task_id, validation_error)
-                self._game.log(f"{record.task_id}: submission rejected: {validation_error}")
+                self._game.log(
+                    f"event=submission task={record.task_id} action=rejected "
+                    f"reason={validation_error} attempt={record.submission_attempts} "
+                    f"confidence={candidate.confidence:.3f} "
+                    f"wrong_attempts={record.wrong_attempts}"
+                )
                 continue
             if self._gate.seconds_until_available() > 0:
                 return 0
 
             self._tracker.transition(record.task_id, TileState.SUBMITTING)
             current = self._tracker.snapshot(record.task_id)
+            self._game.log(
+                f"event=submission task={record.task_id} action=attempt "
+                f"attempt={current.submission_attempts} "
+                f"confidence={candidate.confidence:.3f} "
+                f"format={current.answer_format} wrong_attempts={current.wrong_attempts}"
+            )
             try:
                 decision = self._gate.attempt(
                     current,
@@ -320,15 +384,21 @@ class AgentOrchestrator:
                     f"SUBMIT_EXCEPTION:{type(exc).__name__}",
                     preserve_candidate=True,
                 )
-                self._game.log(f"{record.task_id}: submission failed: {exc!r}")
+                self._game.log(
+                    f"event=submission task={record.task_id} action=retry "
+                    f"reason=SUBMIT_EXCEPTION:{type(exc).__name__} "
+                    f"retry_in_seconds={self._config.error_backoff_seconds:g} "
+                    f"preserve_candidate=True attempt={current.submission_attempts}"
+                )
                 return 0
 
             if decision.action == SubmissionAction.SOLVED:
                 self._tracker.transition(record.task_id, TileState.SOLVED)
-                self._game.log(f"{record.task_id}: correct")
+                self._log_submission_decision(current, decision, preserve_candidate=False)
                 return 1
             if decision.action == SubmissionAction.DEAD:
                 self._tracker.force_dead(record.task_id, decision.reason)
+                self._log_submission_decision(current, decision, preserve_candidate=False)
                 return 1
             if decision.action in {SubmissionAction.RETRY, SubmissionAction.DEFERRED}:
                 if decision.reason == "incorrect":
@@ -338,22 +408,107 @@ class AgentOrchestrator:
                     "locked_out",
                     "GLOBAL_RATE_LIMIT",
                 }
+                retry_delay = (
+                    decision.retry_after_seconds or self._config.solve_retry_seconds
+                )
                 self._tracker.defer(
                     record.task_id,
-                    decision.retry_after_seconds or self._config.solve_retry_seconds,
+                    retry_delay,
                     decision.reason,
                     preserve_candidate=preserve_candidate,
+                )
+                updated = self._tracker.snapshot(record.task_id)
+                self._log_submission_decision(
+                    updated,
+                    decision,
+                    preserve_candidate=preserve_candidate,
+                    retry_in_seconds=retry_delay,
                 )
                 return 1
             if decision.action == SubmissionAction.REJECTED:
                 self._tracker.fail(record.task_id, decision.reason)
+                self._log_submission_decision(current, decision, preserve_candidate=False)
                 return 0
             if decision.action == SubmissionAction.FATAL:
                 self._tracker.fail(record.task_id, decision.reason)
+                self._log_submission_decision(current, decision, preserve_candidate=False)
                 raise FatalSubmissionError(
                     f"{record.task_id}: fatal submission result {decision.reason}"
                 )
         return 0
+
+    def _log_submission_decision(
+        self,
+        record: TileRecord,
+        decision: SubmissionDecision,
+        *,
+        preserve_candidate: bool,
+        retry_in_seconds: float | None = None,
+    ) -> None:
+        retry = (
+            retry_in_seconds
+            if retry_in_seconds is not None
+            else decision.retry_after_seconds
+        )
+        retry_text = f"{retry:g}" if retry is not None else "none"
+        self._game.log(
+            f"event=submission task={record.task_id} action={decision.action.value} "
+            f"reason={decision.reason} attempt={record.submission_attempts} "
+            f"retry_in_seconds={retry_text} "
+            f"preserve_candidate={preserve_candidate} "
+            f"wrong_attempts={record.wrong_attempts}"
+        )
+
+    def _log_cycle(self, report: CycleReport) -> None:
+        state_counts = {state: 0 for state in TileState}
+        for record in self._tracker.snapshots():
+            state_counts[record.state] += 1
+        ordered_states = (
+            TileState.QUEUED,
+            TileState.FETCHING,
+            TileState.SOLVING,
+            TileState.VERIFYING,
+            TileState.READY,
+            TileState.COOLDOWN,
+            TileState.SOLVED,
+            TileState.DEAD,
+            TileState.FAILED,
+        )
+        counts = tuple(state_counts[state] for state in ordered_states)
+        activity = (
+            report.discovered,
+            report.dispatched,
+            report.completed,
+            report.submitted,
+        )
+        fingerprint = (
+            report.phase,
+            report.open_tiles,
+            report.active_workers,
+            counts,
+            activity,
+        )
+        now = self._clock()
+        heartbeat_due = (
+            self._last_cycle_log_at is None
+            or now - self._last_cycle_log_at >= self._config.heartbeat_interval_seconds
+        )
+        if fingerprint == self._last_cycle_fingerprint and not heartbeat_due:
+            return
+        kind = "heartbeat" if fingerprint == self._last_cycle_fingerprint else "change"
+        state_text = ",".join(
+            f"{state.value}:{count}"
+            for state, count in zip(ordered_states, counts)
+            if count
+        ) or "none"
+        self._game.log(
+            f"event=cycle kind={kind} phase={report.phase} open={report.open_tiles} "
+            f"active={report.active_workers} discovered={report.discovered} "
+            f"dispatched={report.dispatched} completed={report.completed} "
+            f"submitted={report.submitted} states={state_text}"
+        )
+        self._last_cycle_fingerprint = fingerprint
+        self._last_cycle_log_at = now
 
     def _is_open_now(self, task_id: str) -> bool:
         board = self._game.board()

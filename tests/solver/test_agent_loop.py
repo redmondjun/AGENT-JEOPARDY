@@ -202,6 +202,74 @@ def test_token_budget_exhaustion_is_typed_and_retryable():
     assert result.failure_code == "TOKEN_BUDGET_EXHAUSTED"
 
 
+def test_model_and_budget_logs_include_cumulative_diagnostics():
+    logs: list[str] = []
+    client = ScriptedModelClient(
+        responses=[text_response("FINAL_ANSWER: do-not-log-me", tokens=8_000)]
+    )
+    engine = SolverEngine(
+        client,
+        _empty_registry(),
+        max_total_tokens=15_000,
+        logger=logs.append,
+    )
+
+    result = engine.solve(make_task())
+
+    assert result.failure_code == "TOKEN_BUDGET_EXHAUSTED"
+    turn_log = next(log for log in logs if "event=model_turn" in log)
+    assert "input_tokens=8000" in turn_log
+    assert "output_tokens=8000" in turn_log
+    assert "turn_tokens=16000" in turn_log
+    assert "total_tokens=16000" in turn_log
+    assert "token_limit=15000" in turn_log
+    assert "elapsed_ms=" in turn_log
+    stop_log = next(log for log in logs if "event=solver_stop" in log)
+    assert "reason=TOKEN_BUDGET_EXHAUSTED" in stop_log
+    assert "turn=1" in stop_log
+    assert "deadline_remaining_ms=" in stop_log
+    assert "do-not-log-me" not in "\n".join(logs)
+
+
+def test_tool_logs_include_safe_structure_but_not_values_or_output():
+    logs: list[str] = []
+    secret = "super-secret-value"
+    output = f"failure output containing {secret}"
+    tool = FakeTool(
+        "read_file",
+        result=ToolResult(ok=False, output=output, error_code="PATH_BLOCKED"),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        tool,
+        ToolSchema("read_file", "read something", {"type": "object"}),
+    )
+    client = ScriptedModelClient(
+        responses=[
+            tool_call_response(
+                "read_file",
+                {"path": "/private/data.txt", "password": secret},
+            ),
+            text_response("FINAL_ANSWER: hidden-answer"),
+        ]
+    )
+    engine = SolverEngine(client, registry, logger=logs.append)
+
+    result = engine.solve(make_task())
+
+    assert result.candidate is not None
+    tool_log = next(log for log in logs if "event=tool_result" in log)
+    assert "error=PATH_BLOCKED" in tool_log
+    assert f"output_chars={len(output)}" in tool_log
+    assert "arg_keys=password,path" in tool_log
+    assert "path_kind=absolute" in tool_log
+    combined = "\n".join(logs)
+    assert secret not in combined
+    assert output not in combined
+    assert "/private/data.txt" not in combined
+    assert "hidden-answer" not in combined
+
+
 def test_deadline_exceeded_before_first_turn_is_typed_and_retryable():
     registry = _empty_registry()
     client = ScriptedModelClient(responses=[])
