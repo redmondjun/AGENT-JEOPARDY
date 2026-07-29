@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from contracts import CandidateAnswer, SolveResult, TaskContext
+from orchestrator.board_loop import AgentOrchestrator, OrchestratorConfig
+from orchestrator.state import TileState
+from orchestrator.submission_gate import SubmissionGate, SubmissionPolicy
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeGame:
+    def __init__(self, tiles: list[dict], responses: list[dict] | None = None) -> None:
+        self.tiles = tiles
+        self.responses = list(responses or [])
+        self.submit_calls: list[tuple[str, str]] = []
+        self.logs: list[str] = []
+        self._root = Path(tempfile.mkdtemp(prefix="agent-loop-test-"))
+
+    def board(self) -> dict:
+        return {"phase": "practice"}
+
+    def open_tiles(self, board=None) -> list[dict]:
+        return [dict(tile) for tile in self.tiles]
+
+    def task(self, task_id: str) -> dict:
+        tile = next(tile for tile in self.tiles if tile["id"] == task_id)
+        return {
+            **tile,
+            "prompt": f"solve {task_id}",
+            "answer_format": tile.get("answer_format", "exact"),
+            "board": "practice",
+            "files": [],
+        }
+
+    def workdir(self, task_id: str) -> Path:
+        path = self._root / task_id
+        path.mkdir(exist_ok=True)
+        return path
+
+    def fetch_files(self, task_id: str, detail: dict, dest=None) -> list[str]:
+        return []
+
+    def submit(self, task_id: str, answer: str) -> dict:
+        self.submit_calls.append((task_id, answer))
+        return self.responses.pop(0)
+
+    def log(self, *values: object) -> None:
+        self.logs.append(" ".join(map(str, values)))
+
+
+class AnswerSolver:
+    def __init__(self, *, fail_task: str | None = None, confidence: float = 0.95) -> None:
+        self.fail_task = fail_task
+        self.confidence = confidence
+
+    def solve(self, task: TaskContext) -> SolveResult:
+        if task.task_id == self.fail_task:
+            raise RuntimeError("boom")
+        return SolveResult(
+            CandidateAnswer(
+                value=f"answer-{task.task_id}",
+                confidence=self.confidence,
+                evidence=("computed",),
+                strategy="fake",
+            ),
+            retryable=False,
+        )
+
+
+def make_orchestrator(
+    game: FakeGame,
+    solver: AnswerSolver,
+    clock: FakeClock,
+    *,
+    max_workers: int = 2,
+) -> AgentOrchestrator:
+    gate = SubmissionGate(
+        game,
+        SubmissionPolicy(default_minimum_confidence=0.8),
+        clock=clock,
+    )
+    return AgentOrchestrator(
+        game,
+        solver,
+        gate,
+        config=OrchestratorConfig(
+            max_workers=max_workers,
+            poll_interval_seconds=0.01,
+            error_backoff_seconds=1.0,
+            task_timeout_seconds=10.0,
+            solve_retry_seconds=5.0,
+        ),
+        clock=clock,
+    )
+
+
+class BoardLoopTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+
+    def test_end_to_end_correct_submission(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "Ancient Scrolls", "points": 100}],
+            [{"result": "correct"}],
+        )
+        agent = make_orchestrator(game, AnswerSolver(), self.clock)
+        try:
+            first = agent.run_cycle()
+            self.assertEqual(first.dispatched, 1)
+            agent.drain_workers(timeout=1)
+            second = agent.run_cycle()
+            self.assertEqual(second.submitted, 1)
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.SOLVED)
+            self.assertEqual(game.submit_calls, [("PR-A1", "answer-PR-A1")])
+        finally:
+            agent.close()
+
+    def test_worker_failure_does_not_poison_other_tile(self) -> None:
+        game = FakeGame(
+            [
+                {"id": "PR-A1", "category": "A", "points": 100},
+                {"id": "PR-B1", "category": "B", "points": 100},
+            ]
+        )
+        agent = make_orchestrator(game, AnswerSolver(fail_task="PR-A1"), self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.COOLDOWN)
+            self.assertEqual(agent.tracker.snapshot("PR-B1").state, TileState.READY)
+        finally:
+            agent.close()
+
+    def test_low_confidence_candidate_never_submits(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}],
+            [{"result": "correct"}],
+        )
+        agent = make_orchestrator(game, AnswerSolver(confidence=0.2), self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            agent.run_cycle()
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.FAILED)
+            self.assertEqual(game.submit_calls, [])
+        finally:
+            agent.close()
+
+    def test_claimed_during_solve_is_discarded(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}],
+            [{"result": "correct"}],
+        )
+        agent = make_orchestrator(game, AnswerSolver(), self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            game.tiles = []
+            agent.run_cycle()
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.DEAD)
+            self.assertEqual(game.submit_calls, [])
+        finally:
+            agent.close()
+
+    def test_submission_gate_serializes_ready_answers(self) -> None:
+        game = FakeGame(
+            [
+                {"id": "PR-A1", "category": "A", "points": 100},
+                {"id": "PR-B1", "category": "B", "points": 100},
+            ],
+            [{"result": "correct"}, {"result": "correct"}],
+        )
+        agent = make_orchestrator(game, AnswerSolver(), self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            first_submit = agent.run_cycle()
+            self.assertEqual(first_submit.submitted, 1)
+            self.assertEqual(len(game.submit_calls), 1)
+            blocked = agent.run_cycle()
+            self.assertEqual(blocked.submitted, 0)
+            self.clock.advance(3.1)
+            second_submit = agent.run_cycle()
+            self.assertEqual(second_submit.submitted, 1)
+            self.assertEqual(len(game.submit_calls), 2)
+        finally:
+            agent.close()
+
+    def test_max_tiles_is_total_selection_not_per_cycle(self) -> None:
+        game = FakeGame(
+            [
+                {"id": "PR-A1", "category": "A", "points": 100},
+                {"id": "PR-B1", "category": "B", "points": 100},
+            ]
+        )
+        gate = SubmissionGate(
+            game,
+            SubmissionPolicy(default_minimum_confidence=0.8),
+            clock=self.clock,
+        )
+        agent = AgentOrchestrator(
+            game,
+            AnswerSolver(confidence=0.2),
+            gate,
+            config=OrchestratorConfig(max_workers=2, max_tiles=1),
+            clock=self.clock,
+        )
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            agent.run_cycle()
+            states = {record.task_id: record.state for record in agent.tracker.snapshots()}
+            self.assertEqual(sum(state == TileState.FAILED for state in states.values()), 1)
+            self.assertEqual(sum(state == TileState.DISCOVERED for state in states.values()), 1)
+        finally:
+            agent.close()
+
+    def test_rate_limited_candidate_is_resubmitted_without_resolve(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}],
+            [{"result": "rate_limited", "retry_in": 2}, {"result": "correct"}],
+        )
+        solver = CountingSolver()
+        agent = make_orchestrator(game, solver, self.clock)
+        try:
+            agent.run_cycle()
+            agent.drain_workers(timeout=1)
+            agent.run_cycle()
+            self.assertEqual(solver.calls, 1)
+            self.clock.advance(3.1)
+            agent.run_cycle()
+            self.assertEqual(solver.calls, 1)
+            self.assertEqual(agent.tracker.snapshot("PR-A1").state, TileState.SOLVED)
+        finally:
+            agent.close()
+
+
+class CountingSolver(AnswerSolver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def solve(self, task: TaskContext) -> SolveResult:
+        self.calls += 1
+        return super().solve(task)
+
+
+if __name__ == "__main__":
+    unittest.main()

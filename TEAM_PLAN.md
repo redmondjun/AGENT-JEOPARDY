@@ -293,6 +293,62 @@ guide. Nandh owns final assembly but does not rewrite specialist internals.
 Keep the process alive, keep workers busy on valuable tiles, and ensure only
 verified, still-open answers reach the API at a legal rate.
 
+### Implementation update from Nandh — 2026-07-29
+
+Status: **Core implementation complete on `feat/nandh-agent-core`; specialist
+integration and live practice validation remain.**
+
+Completed:
+
+- Added frozen, dependency-free cross-team contracts in `contracts.py` for
+  tasks, candidates, solve results, tools, solvers, and the game API.
+- Replaced the serial starter flow with a long-running, dependency-injected
+  orchestrator while retaining a bounded naive fallback for local connectivity
+  checks.
+- Added a thread-safe tile lifecycle with atomic worker claims so one tile
+  cannot be scheduled twice.
+- Added expected-points-per-second prioritization with deterministic,
+  faster-first tie-breaking.
+- Added bounded daemon workers and hard orchestration deadlines so a hung tile
+  cannot permanently consume a worker slot or prevent process exit.
+- Added a verified-answer submission gate with format validation, immediate
+  board recheck, and a 3.1-second global submission interval.
+- Implemented every documented submission result: correct, incorrect,
+  already-claimed, lockout, rate-limit, wrong-phase, forbidden, voided, and
+  unknown-task outcomes.
+- Preserved verified candidates across rate limits and lockouts instead of
+  paying for a second model solve.
+- Added scored/practice cooldown scheduling without blocking other workers.
+- Added rejected-answer history so deterministic solvers cannot repeat an
+  already penalized answer.
+- Added exact tool-value pass-through so model transcription cannot corrupt an
+  exact-match token.
+- Added defensive contract copies, finite timeout validation, solve-attempt
+  budgets, worker-exception isolation, and safe low-confidence rejection.
+- Added automatic `solver.build_solver()` integration. A missing solver uses
+  the safe zero-confidence fallback; an internally broken solver fails loudly.
+- Documented all new runtime knobs in `.env.example`.
+- Added 39 unit and contract tests. All pass on the hosted runtime equivalent,
+  Python 3.12.13.
+
+Validation evidence:
+
+```text
+Python 3.12.13
+Ran 39 tests in 0.007s
+OK
+git diff --check: clean
+```
+
+Still pending before the integrated agent can score:
+
+- Sara must provide `solver.build_solver()` and the model tool-use loop.
+- Jun and Vidula must provide their web and runtime tool implementations.
+- CPU-heavy and model-call limits must be enforced inside the respective tool
+  and solver implementations in addition to the generic tile-worker bound.
+- Run the combined agent against the live practice board with the team key.
+- Build and verify the final allowlisted `agent.zip` after all imports merge.
+
 ### Deliverables
 
 1. Preserve `main.py` as the required root entrypoint.
