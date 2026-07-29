@@ -6,7 +6,13 @@ import os
 from typing import Any
 
 from solver import specialists  # noqa: F401  (register verification checks)
-from solver.agent_loop import AnthropicModelClient, SolverEngine
+from solver.agent_loop import (
+    MAX_TOTAL_TOKENS_DEFAULT,
+    MAX_TURNS_DEFAULT,
+    TOOL_TIMEOUT_SECONDS_DEFAULT,
+    AnthropicModelClient,
+    SolverEngine,
+)
 from solver.registry import ToolRegistry, ToolSchema
 from tools.runtime.tool import get_tools as get_runtime_tools
 from tools.web.tool import WebTool
@@ -67,9 +73,21 @@ def build_solver(*, game: Any, verbose: bool = False) -> SolverEngine:
     return SolverEngine(
         model_client,
         registry,
-        max_turns=int(os.environ.get("SOLVER_MAX_TURNS", "8")),
-        max_total_tokens=int(os.environ.get("SOLVER_MAX_TOTAL_TOKENS", "20000")),
-        tool_timeout_seconds=float(os.environ.get("TOOL_TIMEOUT_SECONDS", "20")),
+        # Defer to agent_loop's constants so the tuned budgets cannot drift
+        # away from the values documented next to them.
+        max_turns=int(
+            os.environ.get("SOLVER_MAX_TURNS", str(MAX_TURNS_DEFAULT))
+        ),
+        max_total_tokens=int(
+            os.environ.get(
+                "SOLVER_MAX_TOTAL_TOKENS", str(MAX_TOTAL_TOKENS_DEFAULT)
+            )
+        ),
+        tool_timeout_seconds=float(
+            os.environ.get(
+                "TOOL_TIMEOUT_SECONDS", str(TOOL_TIMEOUT_SECONDS_DEFAULT)
+            )
+        ),
         logger=game.log,
     )
 

@@ -141,8 +141,8 @@ class MainOrchestratorConfigTests(unittest.TestCase):
     def test_qualifier_defaults_use_modest_width_and_longer_deadline(self) -> None:
         config = main.build_orchestrator_config(max_tiles=0, environ={})
 
-        self.assertEqual(config.max_workers, 6)
-        self.assertEqual(config.task_timeout_seconds, 120.0)
+        self.assertEqual(config.max_workers, 12)
+        self.assertEqual(config.task_timeout_seconds, 180.0)
         self.assertEqual(config.poll_interval_seconds, 2.0)
         self.assertEqual(config.max_solve_attempts, 3)
         self.assertEqual(config.max_tiles, 0)

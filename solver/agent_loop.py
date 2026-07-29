@@ -44,8 +44,18 @@ from solver.prompts import get_system_prompt
 from solver.registry import ToolRegistry
 from solver.verification import verify_candidate
 
-MAX_TURNS_DEFAULT = 8
-MAX_TOTAL_TOKENS_DEFAULT = 20_000
+# A tile that exhausts its turn budget is retried from turn 1 by the
+# orchestrator and hits the identical wall, so an 8-turn ceiling did not save
+# tokens — it spent max_solve_attempts x 8 turns to score zero on any tile
+# needing more depth. The multi-step categories routinely need more: The Dark
+# Web (open, follow, authenticate, submit, verify) and Ship It (list, read,
+# reproduce, patch, re-run) both exceed 8 before they can prove an answer.
+# Budgeting one deeper attempt is close to token-neutral and strictly better
+# expected value. Must stay in step with OrchestratorConfig.task_timeout_seconds
+# — the deadline binds first, and extra turns the clock never reaches are dead
+# configuration.
+MAX_TURNS_DEFAULT = 16
+MAX_TOTAL_TOKENS_DEFAULT = 60_000
 MAX_TOKENS_PER_CALL = 4096  # hard cap per starter guide, section 1
 MAX_HISTORY_MESSAGES = 12
 TOOL_TIMEOUT_SECONDS_DEFAULT = 20.0
@@ -53,7 +63,25 @@ EVIDENCE_TRUNCATE_CHARS = 300
 GROUNDED_CONFIDENCE = 0.82
 UNGROUNDED_CONFIDENCE = 0.70
 MIN_GROUNDED_ANSWER_ALNUM_CHARS = 5
-GROUNDING_TOOL_NAMES = frozenset({"web", "read_file"})
+# Every tool whose output is *observed* rather than authored by the model.
+# A deterministic run_python/run_process result computed against the tile's own
+# data is the strongest evidence we get — stronger than a page read — so it has
+# to count as grounding. Omitting the runtime tools here left every computed
+# answer that did not also emit an `ANSWER:` line at UNGROUNDED_CONFIDENCE,
+# which the 0.80 gate rejects on every tier above 100 points.
+# write_scratch_file is deliberately excluded: it echoes back text the model
+# just wrote, so treating it as evidence would let the model ground itself.
+GROUNDING_TOOL_NAMES = frozenset(
+    {
+        "web",
+        "read_file",
+        "list_files",
+        "run_python",
+        "run_process",
+        "inspect_archive",
+        "extract_archive",
+    }
+)
 _NUMERIC_GROUNDING_PATTERN = (
     r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?%?(?![\w.])"

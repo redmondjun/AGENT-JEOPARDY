@@ -152,6 +152,38 @@ def build_solver() -> tuple[TileSolver, bool]:
     return build_team_solver(game=jp, verbose=VERBOSE), True
 
 
+def solver_budget_log_fields(team_solver_loaded: bool) -> str:
+    """Render the solver's effective budgets for the startup line.
+
+    Read the defaults from ``solver.agent_loop`` rather than repeating them, so
+    the one log line an operator greps at minute 50 cannot claim a turn limit
+    the solver is not actually running.  Imported lazily because the naive
+    baseline path exists precisely for when the solver package is absent.
+    """
+    if not team_solver_loaded:
+        return (
+            "solver_turn_limit=n/a solver_token_limit=n/a "
+            "tool_timeout_seconds=n/a"
+        )
+    from solver.agent_loop import (
+        MAX_TOTAL_TOKENS_DEFAULT,
+        MAX_TURNS_DEFAULT,
+        TOOL_TIMEOUT_SECONDS_DEFAULT,
+    )
+
+    turns = os.environ.get("SOLVER_MAX_TURNS", str(MAX_TURNS_DEFAULT))
+    tokens = os.environ.get(
+        "SOLVER_MAX_TOTAL_TOKENS", str(MAX_TOTAL_TOKENS_DEFAULT)
+    )
+    tool_timeout = os.environ.get(
+        "TOOL_TIMEOUT_SECONDS", str(TOOL_TIMEOUT_SECONDS_DEFAULT)
+    )
+    return (
+        f"solver_turn_limit={turns} solver_token_limit={tokens} "
+        f"tool_timeout_seconds={tool_timeout}"
+    )
+
+
 def build_orchestrator_config(
     *,
     max_tiles: int,
@@ -159,10 +191,22 @@ def build_orchestrator_config(
 ) -> OrchestratorConfig:
     """Build throughput settings calibrated for the hosted qualifier.
 
-    Six workers give the I/O-heavy solver more board width than the original
-    four while staying deliberately modest on the two-CPU host and shared
-    95k-token/minute proxy.  The 120-second deadline prevents useful multi-step
-    web/code attempts from being detached at the former 90-second boundary.
+    The Finale board holds hundreds of tiles and the whole stack is open at
+    once, so width is score.  Twelve workers keep the model-call pipeline busy
+    without oversubscribing the two-CPU host: ``run_python``/``run_process``
+    already serialize behind ``processes.CPU_HEAVY_CONCURRENCY`` (2), so extra
+    workers queue for cores rather than fighting over them, and the surplus
+    capacity goes to the I/O-bound categories (The Dark Web, Ancient Scrolls,
+    Cryptic) that spend their time waiting on HTTP and the proxy.
+
+    The 180-second deadline is set deliberately in step with
+    ``agent_loop.MAX_TURNS_DEFAULT``: the deadline is checked before every turn,
+    so a turn budget the clock cannot reach is dead configuration.  It also
+    absorbs the extra proxy latency that heavier parallelism invites — the event
+    proxy delays calls past the shared per-minute token limit rather than
+    failing them, and a tile killed at its deadline while waiting on a delayed
+    call scores nothing.
+
     Every value remains overridable for live rate-limit or latency tuning.
     """
     settings = os.environ if environ is None else environ
@@ -172,10 +216,10 @@ def build_orchestrator_config(
         if task_id.strip()
     )
     return OrchestratorConfig(
-        max_workers=int(settings.get("MAX_WORKERS", "6")),
+        max_workers=int(settings.get("MAX_WORKERS", "12")),
         poll_interval_seconds=float(settings.get("POLL_SECONDS", "2")),
         task_timeout_seconds=float(
-            settings.get("TASK_TIMEOUT_SECONDS", "120")
+            settings.get("TASK_TIMEOUT_SECONDS", "180")
         ),
         max_tiles=max_tiles,
         max_solve_attempts=int(settings.get("MAX_SOLVE_ATTEMPTS", "3")),
@@ -220,9 +264,7 @@ def main() -> None:
         f"max_solve_attempts={config.max_solve_attempts} "
         f"min_confidence={policy.default_minimum_confidence:.3f} "
         f"task_filter_count={len(config.task_filter)} "
-        f"solver_turn_limit={os.environ.get('SOLVER_MAX_TURNS', '8')} "
-        f"solver_token_limit={os.environ.get('SOLVER_MAX_TOTAL_TOKENS', '20000')} "
-        f"tool_timeout_seconds={os.environ.get('TOOL_TIMEOUT_SECONDS', '20')}"
+        f"{solver_budget_log_fields(team_solver_loaded)}"
     )
     orchestrator = build_orchestrator(
         solver, max_tiles=max_tiles, config=config

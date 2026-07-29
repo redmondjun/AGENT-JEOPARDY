@@ -97,6 +97,7 @@ class AgentOrchestrator:
         )
         self._fatal_error_types = fatal_error_types
         self._limited_task_ids: set[str] = set()
+        self._open_tile_ids: set[str] | None = None
         self._phase: str | None = None
         self._closed = False
         self._last_cycle_fingerprint: tuple[object, ...] | None = None
@@ -114,6 +115,10 @@ class AgentOrchestrator:
         open_tiles = self._game.open_tiles(board)
         discovered = self._tracker.observe_open_tiles(open_tiles)
         active_ids = {str(tile["id"]) for tile in open_tiles}
+        # Publish this cycle's snapshot for the pre-submit recheck so the
+        # latency-critical submission path does not re-fetch a board we just
+        # read. See _is_open_now.
+        self._open_tile_ids = active_ids
         retired = self._pool.retire_except(active_ids)
         if retired:
             self._game.log(
@@ -579,8 +584,28 @@ class AgentOrchestrator:
         self._last_cycle_log_at = now
 
     def _is_open_now(self, task_id: str) -> bool:
-        board = self._game.board()
-        return any(tile.get("id") == task_id for tile in self._game.open_tiles(board))
+        """Last-moment claim check, served from this cycle's board snapshot.
+
+        This runs inside the submission critical path, which is bounded by the
+        one-submission-per-3-seconds team limit. Re-fetching /api/board here
+        added a serialized round trip (30s timeout) to the one code path where
+        latency is literally score — first correct answer takes the tile — even
+        though run_cycle read the same board moments earlier.
+
+        The snapshot is at most poll_interval_seconds stale, and a stale
+        positive is cheap: submitting to a tile another team just took returns
+        ``already_claimed``, which carries no point penalty and is handled as a
+        normal game outcome. Spending a submission slot on that is a far better
+        trade than delaying every submission we make. Falls back to a live
+        fetch if no cycle has published a snapshot yet.
+        """
+        if self._open_tile_ids is None:
+            board = self._game.board()
+            return any(
+                tile.get("id") == task_id
+                for tile in self._game.open_tiles(board)
+            )
+        return task_id in self._open_tile_ids
 
     def _ensure_open(self) -> None:
         if self._closed:
