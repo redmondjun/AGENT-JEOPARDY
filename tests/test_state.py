@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 import threading
+import unittest
 
 from contracts import CandidateAnswer
 from orchestrator.state import InvalidTransition, TileState, TileTracker
@@ -111,6 +111,36 @@ class TileTrackerTests(unittest.TestCase):
         ready = self.tracker.ready()[0]
         self.assertEqual(ready.candidate, candidate)
         self.assertEqual(ready.solve_attempts, 1)
+
+    def test_revive_failed_resets_only_solve_budget_and_preserves_penalty_history(
+        self,
+    ) -> None:
+        self.assertIsNotNone(self.tracker.try_claim_for_fetch("PR-A1"))
+        self.tracker.transition("PR-A1", TileState.SOLVING)
+        self.tracker.transition("PR-A1", TileState.VERIFYING)
+        self.tracker.mark_ready(
+            "PR-A1",
+            CandidateAnswer("penalized", 0.9, ("evidence",), "test"),
+            "exact",
+            "practice",
+        )
+        self.tracker.transition("PR-A1", TileState.SUBMITTING)
+        self.tracker.note_incorrect("PR-A1", "penalized")
+        self.tracker.fail("PR-A1", "SOLVE_ATTEMPTS_EXHAUSTED")
+
+        revived = self.tracker.revive_failed("PR-A1")
+
+        self.assertIsNotNone(revived)
+        assert revived is not None
+        self.assertEqual(revived.state, TileState.DISCOVERED)
+        self.assertEqual(revived.solve_attempts, 0)
+        self.assertEqual(revived.submission_attempts, 1)
+        self.assertEqual(revived.wrong_attempts, 1)
+        self.assertEqual(revived.rejected_answers, ("penalized",))
+        self.assertIsNone(revived.candidate)
+        self.assertEqual(revived.last_error, "REVIVED_AFTER_IDLE")
+        self.assertNotIn("PR-A1", self.tracker.failed_task_ids())
+        self.assertIsNone(self.tracker.revive_failed("PR-A1"))
 
 
 if __name__ == "__main__":
