@@ -373,7 +373,12 @@ class TaskTools:
                 payload["answer_ref"] = self._store_answer(value)
             else:
                 payload["capture_error"] = "response body was empty"
-        return ToolExecution(json.dumps(payload, ensure_ascii=False, default=str))
+        return ToolExecution(
+            self._bounded(
+                json.dumps(payload, ensure_ascii=False, default=str),
+                f"http_result_{self._http_counter}.json",
+            )
+        )
 
     def _tool_finalize_answer(self, args: dict[str, Any]) -> ToolExecution:
         answer_ref = args.get("answer_ref")

@@ -7,6 +7,24 @@ forever. Highest total score across both rounds wins.
 This one file is both the rulebook and the starter-kit README — everything you
 need to go from zero to a deployed agent.
 
+## Competitive agent in this branch
+
+This repository no longer contains the naive starter baseline. `main.py` is a
+long-running competitive agent with bounded concurrent workers, task-scoped
+Python and stateful HTTP tools, adaptive verification, cooldown-aware retries,
+and one rate-limited submission gate.
+
+```bash
+source .env
+python main.py
+python -m unittest discover -s tests -v
+python package_agent.py
+```
+
+The packager writes `agent.zip` from an explicit allowlist and verifies that
+`main.py` is at the archive root. See `IMPLEMENTATION_PLAN.md` for acceptance
+status and practice calibration gates.
+
 ## TLDR
 
 - You will build an agent to compete in two scored rounds of Jeopardy, against other teams' agents (with the same model, limits, and starter kit).
@@ -38,11 +56,10 @@ Besides this README, the kit has four files:
    the hosted image has a copy, so `import jeopardy` works even from a bare
    `main.py` — but ship yours anyway, so the version you tested is the version
    that runs.
-2. **`main.py`** — the **naive baseline**: one model call, no tools, no loop.
-   It scores **zero**. Read its docstring; it's the brief.
-3. **`.env.example`** — the connection settings, plus the three dev knobs
-   `main.py` actually reads (`VERBOSE`, `TASK_FILTER`, `MAX_TILES`). Copy to
-   `.env` (Step 3) or just paste the exports into your shell.
+2. **`main.py`**, **`solver.py`**, and **`tools.py`** — the competitive runtime,
+   tool-use loop, verification policy, and task-scoped tool implementations.
+3. **`.env.example`** — connection settings plus documented runtime knobs.
+   Copy it to `.env` (Step 3) or export the values in your shell.
 4. **`requirements.txt`** — extra Python packages your agent needs (see below).
 
 ## Setup
@@ -125,32 +142,28 @@ are **not** Claude Code credentials, and Claude Code access for local
 development is provided separately. `GET /api/me` returns these values too,
 plus your LLM usage and current rate-limit status.
 
-### 4. Run the baseline
+### 4. Run the competitive agent
 
 ```bash
 uv run -p 3.12 --with anthropic,requests,beautifulsoup4,numpy,pandas,lxml,httpx python main.py   # Option A
 python main.py                                                                                    # Option B (venv active)
 ```
 
-One run **samples 3 tiles** (one per board cell), attempts them serially, and
-exits. That is a deliberate floor, not a survey: `jeopardy.open_tiles()` hands
-back *every* open tile — 60 on the practice board — and a baseline with no
-tools would spend the whole hour proving the same point about each of them.
-Three knobs steer it, and they are the only env vars `main.py` reads:
+The process runs continuously, polls the live board, and admits every open tile
+variant. Six workers solve concurrently by default while one submission gate
+enforces the global rate limit. Useful calibration controls include:
 
 ```bash
-VERBOSE=1 python main.py                              # prompt, reply, raw submit response
-MAX_TILES=1 python main.py                            # sample fewer
-TASK_FILTER=PR-N4,PR-C5,PR-W5 python main.py          # exactly these tiles
+VERBOSE=1 python main.py                         # detailed runtime diagnostics
+MAX_TILES=1 python main.py                       # admit one unique tile this run
+TASK_FILTER=PR-N4,PR-C5,PR-W5 python main.py     # exactly these open tiles
+WORKERS=4 MAX_TURNS=6 python main.py             # bounded calibration run
 ```
 
-The model alone cannot solve these tasks. We measured it with that last
-command: a bare call scores **0/6 on the hardest practice tiles and 0/6 on the easiest
-main-board tiles**, even with the task files pasted into the prompt — it just
-hallucinates confident, well-formatted, wrong answers. Every point you score is
-a thing your harness did. Building the harness — tools, a tool-use loop,
-verification, strategy, concurrency — is the hackathon; the docstring at the
-top of `main.py` is the brief.
+The runtime downloads each tile's files into a stable work directory, lets the
+model act through bounded tools, and accepts an answer only after phase-aware
+verification. Practice is intentionally more permissive; scored rounds require
+programmatic answer capture or an independent reviewer approval.
 
 ## The practice board
 

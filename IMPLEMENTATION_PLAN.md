@@ -7,12 +7,12 @@ Worktree: `/Users/junlee/workspace/AGENT-JEOPARDY-competitive-agent`
 ## Status
 
 - [x] Create the isolated branch and worktree.
-- [ ] Implement task-scoped file, Python, and stateful HTTP tools.
-- [ ] Implement the Anthropic tool-use loop and adaptive verification.
-- [ ] Implement board polling, scheduling, cooldowns, and submission gating.
-- [ ] Add offline unit and integration tests.
-- [ ] Add configuration documentation and deterministic packaging.
-- [ ] Pass Python 3.12 tests and package validation.
+- [x] Implement task-scoped file, Python, and stateful HTTP tools.
+- [x] Implement the Anthropic tool-use loop and adaptive verification.
+- [x] Implement board polling, scheduling, cooldowns, and submission gating.
+- [x] Add offline unit and integration tests.
+- [x] Add configuration documentation and deterministic packaging.
+- [x] Pass Python 3.12 tests and package validation.
 - [ ] Configure local credentials for practice.
 - [ ] Solve at least one practice tile in every category.
 - [ ] Solve at least four of six selected 400/500-point practice tiles.
@@ -51,6 +51,9 @@ accept programmatically captured and deterministically validated candidates at
 No live practice has been run. Credentials are intentionally absent from the
 repository. Record only aggregate category/tier success counts and latency
 here; never record prompts, answers, or secrets.
+
+Offline verification: 14 tests pass on Python 3.12.13. `agent.zip` contains
+the six allowlisted root files and passes CRC validation.
 
 | Category | Tier | Attempts | Correct | Median seconds | Notes |
 |---|---:|---:|---:|---:|---|

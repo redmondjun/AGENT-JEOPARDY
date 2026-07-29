@@ -181,7 +181,11 @@ class CompetitiveAgent:
     def reconcile(self, board: dict[str, Any]) -> None:
         self.latest_board = board
         self.phase = str(board.get("phase", "setup"))
-        open_tiles = jp.open_tiles(board)
+        open_tiles = (
+            jp.open_tiles(board)
+            if self.phase in {"practice", "round1", "game"}
+            else []
+        )
         allowed = set(self.config.task_filter)
         if allowed:
             open_tiles = [tile for tile in open_tiles if tile["id"] in allowed]
