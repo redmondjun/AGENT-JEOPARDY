@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import pathlib
 import tempfile
+import threading
 import time
 
 import requests
@@ -28,8 +29,23 @@ if not BASE or not KEY:
         "Set JEOPARDY_BASE_URL and TEAM_API_KEY first (see .env.example).\n"
         "Get them from /join on the event site.")
 
-_s = requests.Session()
-_s.headers["X-Api-Key"] = KEY
+_sessions = threading.local()
+
+
+def _session() -> requests.Session:
+    """One requests session per worker thread.
+
+    `requests.Session` is intentionally stateful and is not guaranteed to be
+    thread-safe. The competitive agent calls this module through a worker
+    pool, so sharing the starter kit's single global session could mix
+    connection state across simultaneous tiles.
+    """
+    session = getattr(_sessions, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers["X-Api-Key"] = KEY
+        _sessions.session = session
+    return session
 
 
 # ---------------------------------------------------------------- errors
@@ -123,7 +139,7 @@ def board() -> dict:
     correctly. Practice tiles never lock, so this is how you avoid paying to
     solve the same tile twice after a redeploy.
     """
-    b = _json(_s.get(f"{BASE}/api/board", timeout=30), "GET /api/board")
+    b = _json(_session().get(f"{BASE}/api/board", timeout=30), "GET /api/board")
     if "you" not in b:
         # This endpoint takes no auth, so a bad key still returns a flawless
         # board. The `you` block is added only for a key the server
@@ -201,7 +217,7 @@ def task(task_id: str) -> dict:
     Raises TileUnavailable if the row is still locked or the board isn't live
     yet; that is a game state, so catch it and pick another tile.
     """
-    return _json(_s.get(f"{BASE}/api/task/{task_id}", timeout=30),
+    return _json(_session().get(f"{BASE}/api/task/{task_id}", timeout=30),
                  f"GET /api/task/{task_id}", unavailable=(403, 404))
 
 
@@ -234,7 +250,9 @@ def fetch_files(task_id: str, detail: dict,
     for name in detail.get("files", []):
         path = out / name
         if not path.exists() or path.stat().st_size == 0:
-            r = _s.get(f"{BASE}/api/task/{task_id}/file/{name}", timeout=120)
+            r = _session().get(
+                f"{BASE}/api/task/{task_id}/file/{name}", timeout=120
+            )
             # Checked, because r.content on an error is a JSON error blob —
             # unchecked, this wrote `{"detail": "Invalid API key"}` to disk as
             # your 4 MB log file and let the model "solve" that instead.
@@ -255,7 +273,8 @@ def submit(task_id: str, answer: str) -> dict:
     raises. Wrong answers on scored tiles cost points and trigger a doubling
     cooldown, so submit deliberately.
     """
-    res = _json(_s.post(f"{BASE}/api/submit",
+    res = _json(_session().post(
+                        f"{BASE}/api/submit",
                         json={"task_id": task_id, "answer": str(answer)},
                         timeout=30),
                 f"POST /api/submit {task_id}")
@@ -268,7 +287,7 @@ def submit(task_id: str, answer: str) -> dict:
 
 def me() -> dict:
     """Your team, LLM usage, and remaining budget."""
-    return _json(_s.get(f"{BASE}/api/me", timeout=30), "GET /api/me")
+    return _json(_session().get(f"{BASE}/api/me", timeout=30), "GET /api/me")
 
 
 # ---------------------------------------------------------------- the model
