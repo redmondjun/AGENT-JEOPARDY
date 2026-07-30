@@ -58,14 +58,43 @@ def test_cwd_is_locked_to_workdir(workdir: Path) -> None:
     assert result.stdout.strip() == str(workdir.resolve())
 
 
-def test_stdout_truncated_with_marker(workdir: Path) -> None:
+def test_stdout_truncated_keeps_both_ends_with_marker(workdir: Path) -> None:
     result = run_process(
         workdir,
         [sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000)"],
         timeout_seconds=10, max_output_bytes=100)
     assert result.stdout_truncated
-    assert "truncated" in result.stdout
-    assert result.stdout.startswith("x" * 100)
+    assert "truncated: kept 100 of 100000 bytes" in result.stdout
+
+    # Head and tail share the single byte budget, so both ends of the stream
+    # survive and the marker names the gap sitting between them. Asserted as a
+    # property rather than a fixed split so the head:tail ratio can be retuned.
+    head, separator, remainder = result.stdout.partition("\n...[truncated:")
+    assert separator, "expected an in-band truncation marker"
+    _, _, tail = remainder.partition("]\n")
+    assert head and tail, "both ends of a truncated stream should survive"
+    assert set(head) == {"x"} and set(tail) == {"x"}
+    assert len(head) + len(tail) == 100
+
+
+def test_trailing_output_survives_truncation(workdir: Path) -> None:
+    """The `ANSWER:` channel lives on the last line, so the tail must survive.
+
+    Head-only retention silently dropped it for any program that printed more
+    than the byte budget first, losing the one mechanism that carries an exact
+    answer without the model retyping it.
+    """
+    result = run_process(
+        workdir,
+        [sys.executable, "-c",
+         "import sys; sys.stdout.write('x' * 100000 + '\\nANSWER: keep-me\\n')"],
+        timeout_seconds=10, max_output_bytes=100)
+
+    assert result.stdout_truncated
+    assert result.stdout.rstrip().endswith("ANSWER: keep-me")
+    # It has to come from the retained tail, not from the head, so assert it
+    # appears after the marker naming the elided gap.
+    assert result.stdout.index("ANSWER: keep-me") > result.stdout.index("truncated:")
 
 
 def test_timeout_kills_and_reports(workdir: Path) -> None:

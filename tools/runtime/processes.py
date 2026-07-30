@@ -149,12 +149,24 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def _drain(stream, max_bytes: int, box: dict) -> None:
-    """Read a pipe to EOF in a background thread, keeping only the first
-    `max_bytes` but continuing to read (and discard) past that so the child
-    never blocks writing into a full pipe buffer after we've stopped caring.
+    """Read a pipe to EOF in a background thread, keeping the first and last
+    bytes of the stream within a `max_bytes` total budget, and continuing to
+    read past that so the child never blocks writing into a full pipe buffer
+    after we've stopped caring.
+
+    Keeping a tail matters for correctness, not just readability: the
+    `ANSWER:` convention that carries an exact answer from program stdout to
+    ToolResult.exact_value without the model retyping it puts that line at the
+    *end* of the output. Head-only retention silently dropped it for any
+    program that printed more than `max_bytes` first — a verbose Heavy Compute
+    or Needle solution would compute the right answer and then lose the
+    channel that was supposed to protect it. A rolling tail buffer costs no
+    extra memory, since head and tail share the one budget.
     """
-    chunks: list[bytes] = []
-    kept = 0
+    tail_budget = max_bytes // 4
+    head_budget = max_bytes - tail_budget
+    head = bytearray()
+    tail = bytearray()
     total = 0
     try:
         while True:
@@ -162,24 +174,38 @@ def _drain(stream, max_bytes: int, box: dict) -> None:
             if not chunk:
                 break
             total += len(chunk)
-            if kept < max_bytes:
-                take = chunk[: max_bytes - kept]
-                chunks.append(take)
-                kept += len(take)
+            if len(head) < head_budget:
+                take = chunk[: head_budget - len(head)]
+                head += take
+                chunk = chunk[len(take):]
+            if chunk and tail_budget:
+                tail += chunk
+                if len(tail) > tail_budget:
+                    del tail[: len(tail) - tail_budget]
     finally:
         try:
             stream.close()
         except Exception:  # noqa: BLE001
             pass
-    box["data"] = b"".join(chunks)
+    box["head"] = bytes(head)
+    box["tail"] = bytes(tail)
     box["total_bytes"] = total
 
 
 def _decode(box: dict) -> tuple[str, bool]:
-    data: bytes = box.get("data", b"")
-    total: int = box.get("total_bytes", len(data))
-    truncated = total > len(data)
-    text = data.decode("utf-8", errors="replace")
-    if truncated:
-        text += truncation_marker(total, len(data))
-    return text, truncated
+    head: bytes = box.get("head", b"")
+    tail: bytes = box.get("tail", b"")
+    kept = len(head) + len(tail)
+    total: int = box.get("total_bytes", kept)
+    # When nothing was dropped, head and tail are simply the prefix and the
+    # remainder, so concatenating them reproduces the stream exactly.
+    if total <= kept:
+        return (head + tail).decode("utf-8", errors="replace"), False
+    # Otherwise the marker names the gap it sits in, between the two ends.
+    text = (
+        head.decode("utf-8", errors="replace")
+        + truncation_marker(total, kept)
+        + "\n"
+        + tail.decode("utf-8", errors="replace")
+    )
+    return text, True

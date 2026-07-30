@@ -9,7 +9,8 @@ from tools.runtime.errors import INVALID_ARGUMENT, PATH_BLOCKED, PROCESS_FAILED,
 from tools.runtime.tool import (
     ExtractArchiveTool, InspectArchiveTool, ListFilesTool, ReadFileTool,
     RunProcessTool, RunPythonTool, TaskContext, ToolRequest, WriteScratchFileTool,
-    _BaseTool, _MAX_MODEL_READ_BYTES, get_schemas, get_tools,
+    _BaseTool, _MAX_MODEL_READ_BYTES, _MAX_MODEL_STREAM_CHARS, get_schemas,
+    get_tools,
 )
 
 
@@ -150,6 +151,39 @@ def test_run_python_tool_answer_marker_becomes_exact_value(workdir: Path) -> Non
     result = RunPythonTool().execute(_req("run_python", {"code": code}), _task(workdir))
     assert result.ok
     assert result.exact_value == "GHOST-6SAS2HPHXQ5V"
+
+
+def test_run_python_exact_value_survives_verbose_output(workdir: Path) -> None:
+    """A chatty program must not lose its answer or flood the model context.
+
+    Printing a large table before the result is exactly what the data-wrangling
+    categories invite. The answer is extracted from the full capture, so it has
+    to survive, while the text handed to the model stays bounded — an unclipped
+    200 KB stream is roughly 50k tokens, enough on its own to exhaust the
+    solver's cumulative token budget and get the tile retried from scratch.
+    """
+    code = (
+        "for _ in range(20000): print('x' * 20)\n"
+        "print('ANSWER: GHOST-6SAS2HPHXQ5V')\n"
+    )
+    result = RunPythonTool().execute(
+        _req("run_python", {"code": code}, timeout_seconds=60), _task(workdir))
+
+    assert result.ok
+    assert result.exact_value == "GHOST-6SAS2HPHXQ5V"
+    assert "ANSWER: GHOST-6SAS2HPHXQ5V" in result.output
+    assert "clipped:" in result.output
+    assert len(result.output) < 4 * _MAX_MODEL_STREAM_CHARS
+
+
+def test_small_process_output_is_passed_through_unclipped(workdir: Path) -> None:
+    code = "print('concise'); print('ANSWER: 42')"
+    result = RunPythonTool().execute(_req("run_python", {"code": code}), _task(workdir))
+
+    assert result.ok
+    assert result.exact_value == "42"
+    assert "clipped:" not in result.output
+    assert "truncated" not in result.output
 
 
 def test_run_python_tool_timeout_reported_as_typed_error(workdir: Path) -> None:

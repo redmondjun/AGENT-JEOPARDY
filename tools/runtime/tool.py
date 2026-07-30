@@ -29,9 +29,19 @@ ANSWER_MARKER = "ANSWER:"
 _MAX_LISTED_MEMBERS = 200
 # A 200 KB read can consume tens of thousands of input tokens once it is
 # echoed into the next model turn. Keep each read comfortably below the
-# solver's 20k cumulative token budget; callers can page with line/byte ranges
-# or use run_python to search without injecting the whole document.
+# solver's cumulative token budget (agent_loop.MAX_TOTAL_TOKENS_DEFAULT);
+# callers can page with line/byte ranges or use run_python to search without
+# injecting the whole document.
 _MAX_MODEL_READ_BYTES = 12_000
+
+# processes.py captures up to DEFAULT_MAX_OUTPUT_BYTES (200 KB) so that
+# _extract_answer_marker can still find an `ANSWER:` line anywhere in a long
+# run. That capture budget is the wrong number to hand the *model*: 200 KB is
+# roughly 50k tokens, which on its own exhausts the solver's cumulative token
+# budget, and the history keeps re-sending it every turn until compaction drops
+# it. `print(df)` over a Needle-in-the-Haystack CSV is enough to do it. Clip
+# each stream to the same allowance a read_file gets.
+_MAX_MODEL_STREAM_CHARS = 12_000
 _READ_TRUNCATION_GUIDANCE = (
     f"\n...[read_file capped at {_MAX_MODEL_READ_BYTES} bytes; use a smaller "
     "start_line/end_line range, a byte offset/length, or run_python to search]"
@@ -91,12 +101,36 @@ def _extract_answer_marker(stdout: str) -> str | None:
     return value
 
 
+def _clip_stream_for_model(text: str, label: str) -> str:
+    """Bound one captured stream, keeping both ends.
+
+    Head-only truncation is wrong for process output: the `ANSWER:` line is
+    conventionally the last thing printed, and a traceback's actual exception is
+    its final line, so clipping the tail discards exactly the part that decides
+    the tile. Keep both ends and elide the middle. `exact_value` is extracted
+    from the raw stdout by the caller, so the answer channel is unaffected by
+    anything done here.
+    """
+    if len(text) <= _MAX_MODEL_STREAM_CHARS:
+        return text
+    head_chars = _MAX_MODEL_STREAM_CHARS // 2
+    tail_chars = _MAX_MODEL_STREAM_CHARS - head_chars
+    omitted = len(text) - head_chars - tail_chars
+    return (
+        f"{text[:head_chars]}"
+        f"\n...[{label} clipped: {omitted} of {len(text)} characters omitted "
+        f"from the middle. Both ends are shown; re-run printing only what you "
+        f"need, or filter in-process, if the elided span matters]\n"
+        f"{text[-tail_chars:]}"
+    )
+
+
 def _format_process_result(result: ProcessResult) -> str:
     parts = [
         f"exit_code={result.exit_code} timed_out={result.timed_out} "
         f"elapsed_ms={result.elapsed_ms}",
-        f"--- stdout ---\n{result.stdout}",
-        f"--- stderr ---\n{result.stderr}",
+        f"--- stdout ---\n{_clip_stream_for_model(result.stdout, 'stdout')}",
+        f"--- stderr ---\n{_clip_stream_for_model(result.stderr, 'stderr')}",
     ]
     return "\n".join(parts)
 
