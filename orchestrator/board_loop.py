@@ -12,9 +12,11 @@ from typing import Callable, Sequence
 from contracts import GameAPI, SolveResult, TaskContext, TileSolver
 
 from .priority import PriorityPolicy
+from .prefetch import TaskDetailPrefetcher
 from .scheduler import BoundedWorkerPool
 from .state import InvalidTransition, TERMINAL_STATES, TileRecord, TileState, TileTracker
 from .submission_gate import SubmissionAction, SubmissionDecision, SubmissionGate
+from .telemetry import ScoreTracker
 
 
 class FatalSubmissionError(RuntimeError):
@@ -32,6 +34,11 @@ class OrchestratorConfig:
     max_solve_attempts: int = 3
     task_filter: tuple[str, ...] = ()
     heartbeat_interval_seconds: float = 30.0
+    task_prefetch_enabled: bool = True
+    prefetch_workers: int = 2
+    prefetch_lookahead: int = 12
+    prefetch_timeout_seconds: float = 10.0
+    prefetch_join_seconds: float = 0.25
 
     def __post_init__(self) -> None:
         if self.max_workers <= 0:
@@ -50,6 +57,14 @@ class OrchestratorConfig:
             raise ValueError("max_solve_attempts must be positive")
         if self.heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat interval must be positive")
+        if self.prefetch_workers <= 0:
+            raise ValueError("prefetch workers must be positive")
+        if self.prefetch_lookahead < 0:
+            raise ValueError("prefetch lookahead must be non-negative")
+        if self.prefetch_timeout_seconds <= 0:
+            raise ValueError("prefetch timeout must be positive")
+        if self.prefetch_join_seconds < 0:
+            raise ValueError("prefetch join must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -96,10 +111,24 @@ class AgentOrchestrator:
             clock=clock,
         )
         self._fatal_error_types = fatal_error_types
+        self._prefetcher = (
+            TaskDetailPrefetcher(
+                self._game.task,
+                max_workers=self._config.prefetch_workers,
+                timeout_seconds=self._config.prefetch_timeout_seconds,
+                join_seconds=self._config.prefetch_join_seconds,
+                logger=self._game.log,
+            )
+            if self._config.task_prefetch_enabled
+            and self._config.prefetch_lookahead > 0
+            else None
+        )
         self._limited_task_ids: set[str] = set()
         self._open_tile_ids: set[str] | None = None
+        self._cancel_events: dict[str, threading.Event] = {}
         self._phase: str | None = None
         self._closed = False
+        self._score = ScoreTracker(clock=clock)
         self._last_cycle_fingerprint: tuple[object, ...] | None = None
         self._last_cycle_log_at: float | None = None
 
@@ -113,18 +142,41 @@ class AgentOrchestrator:
         board = self._game.board()
         phase = str(board.get("phase") or "unknown")
         open_tiles = self._game.open_tiles(board)
+        self._score.observe_phase(phase)
+        self._score.set_visible_open_points(
+            sum(max(0, int(tile.get("points") or 0)) for tile in open_tiles)
+        )
         discovered = self._tracker.observe_open_tiles(open_tiles)
         active_ids = {str(tile["id"]) for tile in open_tiles}
         # Publish this cycle's snapshot for the pre-submit recheck so the
         # latency-critical submission path does not re-fetch a board we just
         # read. See _is_open_now.
         self._open_tile_ids = active_ids
-        retired = self._pool.retire_except(active_ids)
+        if self._prefetcher is not None:
+            self._prefetcher.retain(active_ids)
+        stale_running = [
+            task_id
+            for task_id, cancel_event in self._cancel_events.items()
+            if task_id not in active_ids and not cancel_event.is_set()
+        ]
+        for task_id in stale_running:
+            self._cancel_events[task_id].set()
+            self._game.log(
+                f"event=cancel task={task_id} reason=no_longer_open"
+            )
+        phase_changed = self._phase is not None and phase != self._phase
+        # Normal board churn must not free capacity while an unkillable model
+        # call is still consuming tokens. That hidden over-concurrency pushed
+        # live usage above the 95k/minute proxy limit. A true phase transition
+        # is the exception: the new scored board gets one fresh generation.
+        retired = self._pool.retire_except(active_ids) if phase_changed else ()
         if retired:
+            for task_id in retired:
+                self._cancel_events.pop(task_id, None)
             self._game.log(
                 f"retired {len(retired)} stale workers: {','.join(retired)}"
             )
-        if self._phase is not None and phase != self._phase:
+        if phase_changed:
             # MAX_TILES is a per-board sampling limit. A practice selection
             # must not prevent qualifier/finale ids from being considered.
             self._limited_task_ids.clear()
@@ -135,6 +187,7 @@ class AgentOrchestrator:
         dispatched = self._dispatch_available()
         if dispatched == 0 and self._revive_failed_if_idle(active_ids):
             dispatched = self._dispatch_available()
+        self._schedule_prefetch()
         return CycleReport(
             phase=phase,
             open_tiles=len(open_tiles),
@@ -179,12 +232,18 @@ class AgentOrchestrator:
     def close(self, *, wait_for_workers: bool = True) -> None:
         if not self._closed:
             self._closed = True
+            for cancel_event in self._cancel_events.values():
+                cancel_event.set()
             self._pool.close(wait=wait_for_workers)
+            self._cancel_events.clear()
+            if self._prefetcher is not None:
+                self._prefetcher.close()
 
     def _collect_completed(self) -> int:
         count = 0
         for work in self._pool.completed():
             count += 1
+            self._cancel_events.pop(work.task_id, None)
             try:
                 result = work.future.result()
             except self._fatal_error_types:
@@ -221,6 +280,7 @@ class AgentOrchestrator:
                 )
                 continue
             solve = result.solve_result
+            self._tracker.note_solve_elapsed(work.task_id, work.elapsed_ms)
             if solve.candidate is None:
                 if solve.retryable:
                     retry_delay = (
@@ -242,6 +302,11 @@ class AgentOrchestrator:
                     )
                 else:
                     self._tracker.fail(work.task_id, solve.failure_code or "SOLVE_FAILED")
+                    self._priority.observe(
+                        record,
+                        correct=False,
+                        elapsed_seconds=max(0.001, work.elapsed_ms / 1000.0),
+                    )
                     self._game.log(
                         f"event=worker_complete task={work.task_id} outcome=failed "
                         f"elapsed_ms={work.elapsed_ms} "
@@ -261,7 +326,12 @@ class AgentOrchestrator:
                 f"event=worker_complete task={work.task_id} outcome=ready "
                 f"elapsed_ms={work.elapsed_ms} attempt={record.solve_attempts} "
                 f"confidence={solve.candidate.confidence:.3f} "
-                f"evidence_count={len(solve.candidate.evidence)}"
+                f"evidence_count={len(solve.candidate.evidence)} "
+                f"strategy={solve.candidate.strategy!r} "
+                f"model_turns={solve.telemetry.model_turns} "
+                f"input_tokens={solve.telemetry.input_tokens} "
+                f"output_tokens={solve.telemetry.output_tokens} "
+                f"tool_calls={','.join(solve.telemetry.tool_calls) or 'none'}"
             )
         return count
 
@@ -313,19 +383,7 @@ class AgentOrchestrator:
         capacity = self._pool.capacity
         if capacity <= 0:
             return 0
-        records = self._tracker.available(now=self._clock())
-        if self._config.task_filter:
-            allowed = set(self._config.task_filter)
-            records = [record for record in records if record.task_id in allowed]
-        ranked = self._priority.rank(records)
-        if self._config.max_tiles:
-            if not self._limited_task_ids:
-                self._limited_task_ids = {
-                    record.task_id for record in ranked[: self._config.max_tiles]
-                }
-            ranked = [
-                record for record in ranked if record.task_id in self._limited_task_ids
-            ]
+        ranked = self._ranked_available()
         dispatched = 0
         for record in ranked[:capacity]:
             if record.solve_attempts >= self._config.max_solve_attempts:
@@ -341,9 +399,13 @@ class AgentOrchestrator:
             )
             if claimed is None:
                 continue
+            cancel_event = threading.Event()
+            self._cancel_events[record.task_id] = cancel_event
             self._pool.submit(
                 record.task_id,
-                lambda task_id=record.task_id: self._solve_one(task_id),
+                lambda task_id=record.task_id, event=cancel_event: self._solve_one(
+                    task_id, event
+                ),
             )
             self._game.log(
                 f"event=dispatch task={record.task_id} "
@@ -354,9 +416,49 @@ class AgentOrchestrator:
             dispatched += 1
         return dispatched
 
-    def _solve_one(self, task_id: str) -> _WorkerResult:
+    def _ranked_available(self) -> list[TileRecord]:
+        """One source of truth for solver and prefetch eligibility."""
+        records = self._tracker.available(now=self._clock())
+        if self._config.task_filter:
+            allowed = set(self._config.task_filter)
+            records = [record for record in records if record.task_id in allowed]
+        ranked = self._priority.rank(records)
+        if self._config.max_tiles:
+            if not self._limited_task_ids:
+                self._limited_task_ids = {
+                    record.task_id for record in ranked[: self._config.max_tiles]
+                }
+            ranked = [
+                record for record in ranked if record.task_id in self._limited_task_ids
+            ]
+        return ranked
+
+    def _schedule_prefetch(self) -> int:
+        if self._prefetcher is None:
+            return 0
+        ranked = self._ranked_available()
+        return self._prefetcher.schedule(
+            [
+                record.task_id
+                for record in ranked[: self._config.prefetch_lookahead]
+            ]
+        )
+
+    def _solve_one(
+        self, task_id: str, cancel_event: threading.Event
+    ) -> _WorkerResult:
         deadline = self._clock() + self._config.task_timeout_seconds
-        detail = self._game.task(task_id)
+        detail_started = time.monotonic()
+        if self._prefetcher is not None:
+            detail, detail_source = self._prefetcher.get(task_id)
+        else:
+            detail = self._game.task(task_id)
+            detail_source = "network"
+        detail_elapsed_ms = int((time.monotonic() - detail_started) * 1000)
+        self._game.log(
+            f"event=task_detail task={task_id} source={detail_source} "
+            f"elapsed_ms={detail_elapsed_ms}"
+        )
         workdir = Path(self._game.workdir(task_id))
         names = self._game.fetch_files(task_id, detail, workdir)
         try:
@@ -372,11 +474,12 @@ class AgentOrchestrator:
                 board=str(detail.get("board") or ""),
             )
 
+        record = self._tracker.snapshot(task_id)
         answer_format = str(detail.get("answer_format") or "exact")
         context = TaskContext(
             task_id=task_id,
-            category=str(detail.get("category") or self._tracker.snapshot(task_id).category),
-            points=int(detail.get("points") or self._tracker.snapshot(task_id).points),
+            category=str(detail.get("category") or record.category),
+            points=int(detail.get("points") or record.points),
             prompt=str(detail.get("prompt") or ""),
             answer_format=answer_format,  # type: ignore[arg-type]
             workdir=workdir,
@@ -384,7 +487,8 @@ class AgentOrchestrator:
             deadline_monotonic=deadline,
             metadata={
                 **detail,
-                "rejected_answers": self._tracker.snapshot(task_id).rejected_answers,
+                "rejected_answers": record.rejected_answers,
+                "cancel_event": cancel_event,
             },
         )
         return _WorkerResult(
@@ -466,8 +570,17 @@ class AgentOrchestrator:
                 return 0
 
             if decision.action == SubmissionAction.SOLVED:
+                self._priority.observe(
+                    current,
+                    correct=True,
+                    elapsed_seconds=max(
+                        0.001, current.last_solve_elapsed_ms / 1000.0
+                    ),
+                )
+                self._score.record_correct(current, decision.raw)
                 self._tracker.transition(record.task_id, TileState.SOLVED)
                 self._log_submission_decision(current, decision, preserve_candidate=False)
+                self._log_score()
                 return 1
             if decision.action == SubmissionAction.DEAD:
                 self._tracker.force_dead(record.task_id, decision.reason)
@@ -476,6 +589,14 @@ class AgentOrchestrator:
             if decision.action in {SubmissionAction.RETRY, SubmissionAction.DEFERRED}:
                 if decision.reason == "incorrect":
                     self._tracker.note_incorrect(record.task_id, candidate.value)
+                    self._priority.observe(
+                        current,
+                        correct=False,
+                        elapsed_seconds=max(
+                            0.001, current.last_solve_elapsed_ms / 1000.0
+                        ),
+                    )
+                    self._score.record_incorrect(current)
                 preserve_candidate = decision.reason in {
                     "rate_limited",
                     "locked_out",
@@ -497,6 +618,8 @@ class AgentOrchestrator:
                     preserve_candidate=preserve_candidate,
                     retry_in_seconds=retry_delay,
                 )
+                if decision.reason == "incorrect":
+                    self._log_score()
                 return 1
             if decision.action == SubmissionAction.REJECTED:
                 self._tracker.fail(record.task_id, decision.reason)
@@ -530,6 +653,22 @@ class AgentOrchestrator:
             f"retry_in_seconds={retry_text} "
             f"preserve_candidate={preserve_candidate} "
             f"wrong_attempts={record.wrong_attempts}"
+        )
+
+    def _log_score(self) -> None:
+        score = self._score.snapshot()
+        penalty_ratio = (
+            score.penalty_points / score.earned_points
+            if score.earned_points
+            else 0.0
+        )
+        self._game.log(
+            f"event=score correct={score.correct_tiles} "
+            f"incorrect={score.incorrect_tiles} earned={score.earned_points} "
+            f"penalties={score.penalty_points} net={score.net_points} "
+            f"pace_per_minute={score.net_points_per_minute:.1f} "
+            f"penalty_ratio={penalty_ratio:.4f} "
+            f"visible_open_points={score.visible_open_points}"
         )
 
     def _log_cycle(self, report: CycleReport) -> None:
@@ -574,11 +713,20 @@ class AgentOrchestrator:
             for state, count in zip(ordered_states, counts)
             if count
         ) or "none"
+        prefetch_text = "disabled"
+        if self._prefetcher is not None:
+            stats = self._prefetcher.snapshot()
+            prefetch_text = (
+                f"scheduled:{stats.scheduled},completed:{stats.completed},"
+                f"hits:{stats.cache_hits},joined:{stats.joined_hits},"
+                f"misses:{stats.misses},failures:{stats.failures}"
+            )
         self._game.log(
             f"event=cycle kind={kind} phase={report.phase} open={report.open_tiles} "
             f"active={report.active_workers} discovered={report.discovered} "
             f"dispatched={report.dispatched} completed={report.completed} "
-            f"submitted={report.submitted} states={state_text}"
+            f"submitted={report.submitted} states={state_text} "
+            f"prefetch={prefetch_text}"
         )
         self._last_cycle_fingerprint = fingerprint
         self._last_cycle_log_at = now

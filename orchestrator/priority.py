@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+import threading
 from typing import Mapping, Sequence
 
 from .state import TileRecord
@@ -45,6 +46,8 @@ class PriorityPolicy:
     ) -> None:
         self._calibrations = dict(calibrations or {})
         self._category_weights = dict(category_weights or {})
+        self._lock = threading.RLock()
+        self._observations: dict[tuple[str, int], _AdaptiveCalibration] = {}
         if any(
             not math.isfinite(weight) or weight < 0
             for weight in self._category_weights.values()
@@ -52,13 +55,31 @@ class PriorityPolicy:
             raise ValueError("category weights must be finite and non-negative")
 
     def calibration_for(self, record: TileRecord) -> Calibration:
-        calibration = self._calibrations.get((record.category, record.points))
-        if calibration is not None:
-            return calibration
-        return Calibration(
-            solve_probability=_DEFAULT_PROBABILITY.get(record.points, 0.25),
-            expected_seconds=_DEFAULT_SECONDS.get(record.points, 60.0),
-        )
+        key = (record.category, record.points)
+        with self._lock:
+            adaptive = self._observations.get(key)
+            if adaptive is not None:
+                return adaptive.value
+            calibration = self._calibrations.get(key)
+            if calibration is not None:
+                return calibration
+            return Calibration(
+                solve_probability=_DEFAULT_PROBABILITY.get(record.points, 0.25),
+                expected_seconds=_DEFAULT_SECONDS.get(record.points, 60.0),
+            )
+
+    def observe(self, record: TileRecord, *, correct: bool, elapsed_seconds: float) -> None:
+        """Update category/tier priors without letting one result dominate."""
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+            return
+        key = (record.category, record.points)
+        with self._lock:
+            adaptive = self._observations.get(key)
+            if adaptive is None:
+                prior = self.calibration_for(record)
+                adaptive = _AdaptiveCalibration.from_prior(prior)
+                self._observations[key] = adaptive
+            adaptive.observe(correct=correct, elapsed_seconds=elapsed_seconds)
 
     def score(self, record: TileRecord) -> float:
         calibration = self.calibration_for(record)
@@ -88,11 +109,14 @@ class PriorityPolicy:
             start = end
         return diversified
 
-    def _base_rank_key(self, record: TileRecord) -> tuple[float, float, int, str]:
+    def _base_rank_key(
+        self, record: TileRecord
+    ) -> tuple[float, float, int, int, str]:
         return (
             -self.score(record),
             self.calibration_for(record).expected_seconds,
             -record.points,
+            record.discovery_order,
             record.task_id,
         )
 
@@ -124,3 +148,35 @@ class PriorityPolicy:
             cell = (record.category, record.points)
             cell_uses[cell] = cell_uses.get(cell, 0) + 1
         return result
+
+
+@dataclass
+class _AdaptiveCalibration:
+    alpha: float
+    beta: float
+    expected_seconds: float
+
+    @classmethod
+    def from_prior(cls, prior: Calibration) -> "_AdaptiveCalibration":
+        prior_weight = 4.0
+        return cls(
+            alpha=max(0.01, prior.solve_probability * prior_weight),
+            beta=max(0.01, (1.0 - prior.solve_probability) * prior_weight),
+            expected_seconds=prior.expected_seconds,
+        )
+
+    @property
+    def value(self) -> Calibration:
+        return Calibration(
+            solve_probability=self.alpha / (self.alpha + self.beta),
+            expected_seconds=max(0.1, self.expected_seconds),
+        )
+
+    def observe(self, *, correct: bool, elapsed_seconds: float) -> None:
+        if correct:
+            self.alpha += 1.0
+        else:
+            self.beta += 1.0
+        # A conservative EWMA reacts during a round without thrashing after
+        # one unusually fast or slow tile.
+        self.expected_seconds = 0.75 * self.expected_seconds + 0.25 * elapsed_seconds

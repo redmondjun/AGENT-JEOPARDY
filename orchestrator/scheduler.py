@@ -91,7 +91,7 @@ class BoundedWorkerPool(Generic[T]):
             self._reap_retired_locked()
             return len(self._retired)
 
-    def submit(self, task_id: str, function: Callable[[], T]) -> None:
+    def submit(self, task_id: str, function: Callable[[], T]) -> Future[T]:
         with self._lock:
             if self.capacity <= 0:
                 raise RuntimeError("worker pool is full")
@@ -126,6 +126,7 @@ class BoundedWorkerPool(Generic[T]):
                 started_at=self._clock(),
             )
             thread.start()
+            return future
 
     def retire_except(self, active_task_ids: set[str]) -> tuple[str, ...]:
         """Quarantine running work whose tile is no longer on the live board."""

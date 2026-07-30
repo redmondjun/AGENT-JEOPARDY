@@ -428,9 +428,27 @@ in the agent. Concretely:
   in its container. If it crashes on a malformed page at minute 4, you
   lose 56 minutes. Watch `GET /api/agent/logs`, wrap everything, resubmit
   fast (resubmitting redeploys instantly).
+
 - **Practice is your calibration.** It mirrors the scored board tier for tier
   and is free all day — what your agent can't clear there, it won't clear
   when it counts.
 - The model can't do these tasks in its head — and neither can you in the
   time available. Everything runs through tools: run code, keep cookies,
   read the actual bytes.
+
+### Measure the 80K pace
+
+The production agent emits secret-safe key/value telemetry for dispatch,
+fetch, solve, submission, score pace, tokens, tools, and prefetch cache use.
+Score a captured practice or replay log against the readiness gates with:
+
+```bash
+python scripts/replay_benchmark.py agent.log --available-points 100000
+```
+
+When comparing cold-cache six- and eight-worker runs, select eight only when
+it clears the throughput, token, latency, timeout, and error gates:
+
+```bash
+python scripts/select_worker_count.py six.json eight.json
+```

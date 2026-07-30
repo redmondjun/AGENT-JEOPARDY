@@ -118,6 +118,25 @@ class PriorityPolicyTests(unittest.TestCase):
         self.assertEqual(forward, reverse)
         self.assertEqual(forward, ["a-1", "b-1", "a-2"])
 
+    def test_online_observations_update_category_tier_calibration(self) -> None:
+        record = TileRecord("a", "Data", 100)
+        policy = PriorityPolicy()
+        before = policy.calibration_for(record)
+
+        policy.observe(record, correct=False, elapsed_seconds=40.0)
+        after = policy.calibration_for(record)
+
+        self.assertLess(after.solve_probability, before.solve_probability)
+        self.assertGreater(after.expected_seconds, before.expected_seconds)
+
+    def test_server_discovery_order_breaks_equal_priority_ties(self) -> None:
+        first = TileRecord("z", "Data", 100, discovery_order=1)
+        second = TileRecord("a", "Data", 100, discovery_order=2)
+        self.assertEqual(
+            [item.task_id for item in PriorityPolicy().rank([second, first])],
+            ["z", "a"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

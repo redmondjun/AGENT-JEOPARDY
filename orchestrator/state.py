@@ -72,6 +72,10 @@ class TileRecord:
     rejected_answers: tuple[str, ...] = ()
     last_error: str | None = None
     updated_at: float = 0.0
+    discovery_order: int = 0
+    remaining_in_cell: int = 0
+    total_in_cell: int = 0
+    last_solve_elapsed_ms: int = 0
 
 
 class TileTracker:
@@ -81,6 +85,7 @@ class TileTracker:
         self._clock = clock
         self._lock = threading.RLock()
         self._records: dict[str, TileRecord] = {}
+        self._next_discovery_order = 0
 
     def observe_open_tiles(self, tiles: Iterable[dict]) -> int:
         """Upsert open tiles and mark disappeared non-terminal work as dead."""
@@ -93,18 +98,28 @@ class TileTracker:
                 open_ids.add(task_id)
                 record = self._records.get(task_id)
                 if record is None:
+                    self._next_discovery_order += 1
                     self._records[task_id] = TileRecord(
                         task_id=task_id,
                         category=str(tile.get("category") or "Unknown"),
                         points=int(tile.get("points") or 0),
                         board=str(tile.get("board") or ""),
                         updated_at=now,
+                        discovery_order=self._next_discovery_order,
+                        remaining_in_cell=int(tile.get("remaining") or 0),
+                        total_in_cell=int(tile.get("total") or 0),
                     )
                     created += 1
                 elif record.state not in TERMINAL_STATES:
                     record.category = str(tile.get("category") or record.category)
                     record.points = int(tile.get("points") or record.points)
                     record.board = str(tile.get("board") or record.board)
+                    record.remaining_in_cell = int(
+                        tile.get("remaining") or record.remaining_in_cell
+                    )
+                    record.total_in_cell = int(
+                        tile.get("total") or record.total_in_cell
+                    )
                     record.updated_at = now
 
             for record in self._records.values():
@@ -161,6 +176,15 @@ class TileTracker:
             record.board = board or record.board
             record.state = TileState.READY
             record.last_error = None
+            record.updated_at = self._clock()
+        return replace(record)
+
+    def note_solve_elapsed(self, task_id: str, elapsed_ms: int) -> TileRecord:
+        if elapsed_ms < 0:
+            raise ValueError("elapsed_ms must be non-negative")
+        with self._lock:
+            record = self._require(task_id)
+            record.last_solve_elapsed_ms = elapsed_ms
             record.updated_at = self._clock()
             return replace(record)
 

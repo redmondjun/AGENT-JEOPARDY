@@ -109,6 +109,50 @@ def make_orchestrator(
     )
 
 
+def failed_tracker(
+    game: FakeGame,
+    clock: FakeClock,
+    *,
+    task_id: str = "PR-A1",
+) -> TileTracker:
+    tracker = TileTracker(clock=clock)
+    tracker.observe_open_tiles(game.open_tiles())
+    claimed = tracker.try_claim_for_fetch(task_id, now=clock())
+    if claimed is None:
+        raise AssertionError(f"fixture could not claim {task_id}")
+    tracker.fail(task_id, "SOLVE_ATTEMPTS_EXHAUSTED")
+    return tracker
+
+
+def tracked_orchestrator(
+    game: FakeGame,
+    tracker: TileTracker,
+    clock: FakeClock,
+    **config_overrides,
+) -> AgentOrchestrator:
+    gate = SubmissionGate(
+        game,
+        SubmissionPolicy(default_minimum_confidence=0.8),
+        clock=clock,
+    )
+    config = {
+        "max_workers": 2,
+        "poll_interval_seconds": 0.01,
+        "error_backoff_seconds": 1.0,
+        "task_timeout_seconds": 10.0,
+        "solve_retry_seconds": 5.0,
+    }
+    config.update(config_overrides)
+    return AgentOrchestrator(
+        game,
+        AnswerSolver(),
+        gate,
+        config=OrchestratorConfig(**config),
+        tracker=tracker,
+        clock=clock,
+    )
+
+
 class BoardLoopTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = FakeClock()
@@ -416,6 +460,48 @@ class BoardLoopTests(unittest.TestCase):
         finally:
             agent.close()
 
+    def test_claimed_worker_cancels_without_opening_hidden_capacity(self) -> None:
+        game = FakeGame(
+            [{"id": "PR-A1", "category": "A", "points": 100}]
+        )
+        solver = CancellationAwareSolver()
+        gate = SubmissionGate(
+            game,
+            SubmissionPolicy(default_minimum_confidence=0.8),
+            clock=self.clock,
+        )
+        agent = AgentOrchestrator(
+            game,
+            solver,
+            gate,
+            config=OrchestratorConfig(
+                max_workers=1,
+                task_timeout_seconds=10,
+                task_prefetch_enabled=False,
+            ),
+            clock=self.clock,
+        )
+        try:
+            self.assertEqual(agent.run_cycle().dispatched, 1)
+            self.assertTrue(solver.started.wait(1))
+
+            game.tiles = [
+                {"id": "PR-B1", "category": "B", "points": 100}
+            ]
+            churn = agent.run_cycle()
+
+            self.assertEqual(churn.dispatched, 0)
+            self.assertEqual(churn.active_workers, 1)
+            self.assertEqual(
+                agent.tracker.snapshot("PR-A1").state, TileState.DEAD
+            )
+            self.assertTrue(solver.cancelled.wait(1))
+
+            agent.drain_workers(timeout=1)
+            self.assertEqual(agent.run_cycle().dispatched, 1)
+        finally:
+            agent.close(wait_for_workers=False)
+
     def test_submission_gate_serializes_ready_answers(self) -> None:
         game = FakeGame(
             [
@@ -634,6 +720,26 @@ class PhaseBlockingSolver(AnswerSolver):
     def solve(self, task: TaskContext) -> SolveResult:
         if task.task_id.startswith("PR-"):
             self.release_practice.wait()
+        return super().solve(task)
+
+
+class CancellationAwareSolver(AnswerSolver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def solve(self, task: TaskContext) -> SolveResult:
+        self.started.set()
+        cancel_event = task.metadata["cancel_event"]
+        cancel_event.wait(1)
+        if cancel_event.is_set():
+            self.cancelled.set()
+            return SolveResult(
+                candidate=None,
+                retryable=False,
+                failure_code="TILE_BECAME_STALE",
+            )
         return super().solve(task)
 
 

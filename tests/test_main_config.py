@@ -141,12 +141,15 @@ class MainOrchestratorConfigTests(unittest.TestCase):
     def test_qualifier_defaults_use_modest_width_and_longer_deadline(self) -> None:
         config = main.build_orchestrator_config(max_tiles=0, environ={})
 
-        self.assertEqual(config.max_workers, 12)
+        self.assertEqual(config.max_workers, 6)
         self.assertEqual(config.task_timeout_seconds, 180.0)
         self.assertEqual(config.poll_interval_seconds, 2.0)
         self.assertEqual(config.max_solve_attempts, 3)
         self.assertEqual(config.max_tiles, 0)
         self.assertEqual(config.task_filter, ())
+        self.assertTrue(config.task_prefetch_enabled)
+        self.assertEqual(config.prefetch_workers, 2)
+        self.assertEqual(config.prefetch_lookahead, 12)
 
     def test_every_orchestration_setting_remains_overridable(self) -> None:
         config = main.build_orchestrator_config(
@@ -157,6 +160,9 @@ class MainOrchestratorConfigTests(unittest.TestCase):
                 "POLL_SECONDS": "0.75",
                 "MAX_SOLVE_ATTEMPTS": "5",
                 "TASK_FILTER": " Q-A1, ,Q-C2,Q-W3 ",
+                "TASK_PREFETCH": "0",
+                "PREFETCH_WORKERS": "1",
+                "PREFETCH_LOOKAHEAD": "5",
             },
         )
 
@@ -166,6 +172,9 @@ class MainOrchestratorConfigTests(unittest.TestCase):
         self.assertEqual(config.max_solve_attempts, 5)
         self.assertEqual(config.max_tiles, 11)
         self.assertEqual(config.task_filter, ("Q-A1", "Q-C2", "Q-W3"))
+        self.assertFalse(config.task_prefetch_enabled)
+        self.assertEqual(config.prefetch_workers, 1)
+        self.assertEqual(config.prefetch_lookahead, 5)
 
     def test_invalid_resource_overrides_fail_before_agent_start(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_workers must be positive"):

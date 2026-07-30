@@ -1,3 +1,4 @@
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,21 @@ def test_initial_prompt_uses_task_relative_file_paths_for_runtime_tools():
 
     assert "Attached files:\n- inputs/records.csv" in prompt
     assert f"- {workdir}/inputs/records.csv" not in prompt
+
+
+def test_cancelled_tile_stops_before_spending_model_tokens():
+    cancel_event = threading.Event()
+    cancel_event.set()
+    task = replace(make_task(), metadata={"cancel_event": cancel_event})
+    client = ScriptedModelClient()
+
+    result = SolverEngine(client, _empty_registry()).solve(task)
+
+    assert result.candidate is None
+    assert result.failure_code == "TILE_BECAME_STALE"
+    assert result.retryable is False
+    assert result.telemetry.model_turns == 0
+    assert client.calls == 0
 
 
 def test_history_compaction_keeps_tool_use_and_result_as_an_atomic_pair():
@@ -309,6 +325,7 @@ def test_over_budget_prose_preserves_prior_exact_value():
     assert result.candidate.value == "12345"
     assert result.candidate.confidence == 0.95
     assert result.candidate.exact_value_from_tool is True
+    assert client.calls == 1
 
 
 def test_deadline_exceeded_before_first_turn_is_typed_and_retryable():
@@ -442,6 +459,7 @@ def test_exact_value_from_tool_bypasses_model_retyping():
     assert result.candidate is not None
     assert result.candidate.value == "3.14159265"
     assert result.candidate.exact_value_from_tool is True
+    assert client.calls == 1
 
 
 def test_exact_value_auto_finalizes_when_model_omits_answer_envelope():
@@ -473,7 +491,7 @@ def test_exact_value_auto_finalizes_when_model_omits_answer_envelope():
     assert result.candidate.exact_value_from_tool is True
     assert result.candidate.confidence == 0.95
     assert "[calc] verified computation complete" in result.candidate.evidence
-    assert "The tool produced the verified result above." in result.candidate.evidence
+    assert client.calls == 1
     assert any("auto-finalizing tool exact_value" in message for message in logs)
 
 

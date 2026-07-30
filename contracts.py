@@ -89,11 +89,32 @@ class CandidateAnswer:
 
 
 @dataclass(frozen=True)
+class SolveTelemetry:
+    """Non-secret measurements produced while solving one tile."""
+
+    elapsed_ms: int = 0
+    model_turns: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tool_calls: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if min(
+            self.elapsed_ms,
+            self.model_turns,
+            self.input_tokens,
+            self.output_tokens,
+        ) < 0:
+            raise ValueError("solve telemetry counters must be non-negative")
+
+
+@dataclass(frozen=True)
 class SolveResult:
     candidate: CandidateAnswer | None
     retryable: bool
     failure_code: str | None = None
     retry_after_seconds: float | None = None
+    telemetry: SolveTelemetry = field(default_factory=SolveTelemetry)
 
     def __post_init__(self) -> None:
         if self.candidate is not None and self.failure_code is not None:

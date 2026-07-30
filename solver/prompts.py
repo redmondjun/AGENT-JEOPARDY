@@ -20,13 +20,16 @@ _BASE = f"""
 Solve one tile quickly and deterministically. Available tool names are exactly:
 {_TOOLS}.
 Call only those names. Prefer the smallest tool output that proves the answer;
-do not guess, repeatedly list files, or read a large file in full.
+do not guess, repeatedly list files, or read a large file in full. The user
+message includes a bounded preflight manifest. Trust it and skip list_files
+unless a tool reports that a listed path is missing or the directory changed.
 """.strip()
 
 _CATEGORY_PROMPTS: dict[str, str] = {
     "Needle in the Haystack": """
 Needle in the Haystack workflow:
-1. Use list_files once to locate inputs.
+1. Use the preflight schema/profile to locate inputs; skip list_files unless
+   the manifest is inconsistent.
 2. Search/filter large files with run_python; use read_file only for a small
    targeted file or line range that confirms the match.
 3. Make the final deterministic script print `ANSWER: <exact value>` so
@@ -42,7 +45,8 @@ The Dark Web workflow:
 """.strip(),
     "Ship It": """
 Ship It workflow:
-1. Use list_files, then read_file only on likely source/test files.
+1. Use the preflight source/test hints; skip list_files unless inconsistent,
+   then use read_file only on likely source/test files.
 2. Reproduce the failure with run_process using an argv array (no shell syntax).
 3. Apply the smallest fix with write_scratch_file or run_python, then rerun the
    focused test with run_process. Do not answer without a passing check.
@@ -51,7 +55,8 @@ Ship It workflow:
 """.strip(),
     "Ancient Scrolls": """
 Ancient Scrolls workflow:
-1. Use list_files. For archives, call inspect_archive before extract_archive.
+1. Use the preflight manifest; skip list_files unless inconsistent. For
+   archives, call inspect_archive before extract_archive.
 2. Search/index documents with run_python; avoid loading whole documents into
    the conversation. Confirm only the relevant passage with read_file ranges.
 3. If extraction or computation yields the answer, make run_python print
@@ -59,8 +64,9 @@ Ancient Scrolls workflow:
 """.strip(),
     "Cryptic": """
 Cryptic workflow:
-1. Use list_files and read_file to identify the artifact. Use inspect_archive
-   before extract_archive; use run_process for format inspection when useful.
+1. Use the preflight format hints and read_file only for a targeted read; skip
+   list_files unless inconsistent. Use inspect_archive before extract_archive;
+   use run_process when useful.
 2. Decode/transform with run_python, testing cheap common encodings first and
    validating the result against the prompt.
 3. The successful script must print `ANSWER: <exact value>` so run_python

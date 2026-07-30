@@ -33,12 +33,12 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from threading import Thread
 from typing import Any, Callable, Protocol, TypeVar
 
-from contracts import CandidateAnswer, SolveResult, TaskContext
+from contracts import CandidateAnswer, SolveResult, SolveTelemetry, TaskContext
 from solver.answer_parser import extract_final_answer, normalize_answer
 from solver.prompts import get_system_prompt
 from solver.registry import ToolRegistry
@@ -55,7 +55,9 @@ from solver.verification import verify_candidate
 # — the deadline binds first, and extra turns the clock never reaches are dead
 # configuration.
 MAX_TURNS_DEFAULT = 16
-MAX_TOTAL_TOKENS_DEFAULT = 60_000
+# Six workers at this per-tile ceiling leave headroom under the hosted
+# 95k-token/minute proxy limit even when several long solves overlap.
+MAX_TOTAL_TOKENS_DEFAULT = 30_000
 MAX_TOKENS_PER_CALL = 4096  # hard cap per starter guide, section 1
 MAX_HISTORY_MESSAGES = 12
 TOOL_TIMEOUT_SECONDS_DEFAULT = 20.0
@@ -148,6 +150,24 @@ class SolverEngine:
         self._logger = logger or (lambda _message: None)
 
     def solve(self, task: TaskContext) -> SolveResult:
+        solve_started = time.monotonic()
+        model_turns = 0
+        input_tokens = 0
+        output_tokens = 0
+        invoked_tools: list[str] = []
+
+        def finish(result: SolveResult) -> SolveResult:
+            return replace(
+                result,
+                telemetry=SolveTelemetry(
+                    elapsed_ms=int((time.monotonic() - solve_started) * 1000),
+                    model_turns=model_turns,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    tool_calls=tuple(invoked_tools),
+                ),
+            )
+
         self._logger(
             f"event=solve_start task={task.task_id} category={task.category!r} "
             f"points={task.points} files={len(task.files)} "
@@ -166,6 +186,18 @@ class SolverEngine:
         total_tokens = 0
 
         for turn_index in range(self._max_turns):
+            if _task_cancelled(task):
+                self._log_stop(
+                    task,
+                    reason="TILE_BECAME_STALE",
+                    turn=turn_index,
+                    total_tokens=total_tokens,
+                )
+                return finish(SolveResult(
+                    candidate=None,
+                    retryable=False,
+                    failure_code="TILE_BECAME_STALE",
+                ))
             if time.monotonic() >= task.deadline_monotonic:
                 self._log_stop(
                     task,
@@ -173,11 +205,11 @@ class SolverEngine:
                     turn=turn_index,
                     total_tokens=total_tokens,
                 )
-                return SolveResult(
+                return finish(SolveResult(
                     candidate=None,
                     retryable=True,
                     failure_code="DEADLINE_EXCEEDED",
-                )
+                ))
 
             messages = _compact_history(messages)
 
@@ -199,11 +231,11 @@ class SolverEngine:
                     f"elapsed_ms={int((time.monotonic() - model_started) * 1000)} "
                     f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
                 )
-                return SolveResult(
+                return finish(SolveResult(
                     candidate=None,
                     retryable=True,
                     failure_code="MODEL_CALL_TIMEOUT",
-                )
+                ))
             except Exception as exc:  # noqa: BLE001 - SDK/network boundary
                 # Exception messages from HTTP clients can contain request URLs,
                 # headers, or response bodies. Log only the exception class.
@@ -213,12 +245,15 @@ class SolverEngine:
                     f"elapsed_ms={int((time.monotonic() - model_started) * 1000)} "
                     f"deadline_remaining_ms={_remaining_ms(task.deadline_monotonic)}"
                 )
-                return SolveResult(
+                return finish(SolveResult(
                     candidate=None,
                     retryable=True,
                     failure_code="MODEL_API_ERROR",
-                )
+                ))
             model_elapsed_ms = int((time.monotonic() - model_started) * 1000)
+            model_turns += 1
+            input_tokens += response.input_tokens
+            output_tokens += response.output_tokens
             turn_tokens = response.input_tokens + response.output_tokens
             total_tokens += turn_tokens
             self._logger(
@@ -246,17 +281,31 @@ class SolverEngine:
                     turn=turn_index + 1,
                     total_tokens=total_tokens,
                 )
-                return SolveResult(
+                return finish(SolveResult(
                     candidate=None,
                     retryable=True,
                     failure_code="TOKEN_BUDGET_EXHAUSTED",
-                )
+                ))
 
             messages.append({"role": "assistant", "content": response.raw_content})
 
             if response.tool_calls:
                 tool_result_blocks = []
+                turn_exact_value: str | None = None
                 for call_index, call in enumerate(response.tool_calls, start=1):
+                    invoked_tools.append(call.name)
+                    if _task_cancelled(task):
+                        self._log_stop(
+                            task,
+                            reason="TILE_BECAME_STALE",
+                            turn=turn_index + 1,
+                            total_tokens=total_tokens,
+                        )
+                        return finish(SolveResult(
+                            candidate=None,
+                            retryable=False,
+                            failure_code="TILE_BECAME_STALE",
+                        ))
                     remaining_seconds = task.deadline_monotonic - time.monotonic()
                     if remaining_seconds <= 0:
                         self._log_stop(
@@ -265,11 +314,11 @@ class SolverEngine:
                             turn=turn_index + 1,
                             total_tokens=total_tokens,
                         )
-                        return SolveResult(
+                        return finish(SolveResult(
                             candidate=None,
                             retryable=True,
                             failure_code="DEADLINE_EXCEEDED",
-                        )
+                        ))
 
                     # A tool must never receive a timeout that extends beyond
                     # the tile's global deadline. Well-behaved runtime/web
@@ -301,11 +350,11 @@ class SolverEngine:
                             f"arg_keys={_argument_keys(call.arguments)} "
                             f"path_kind={_path_kind(call.arguments)}"
                         )
-                        return SolveResult(
+                        return finish(SolveResult(
                             candidate=None,
                             retryable=True,
                             failure_code="TOOL_CALL_TIMEOUT",
-                        )
+                        ))
                     self._logger(
                         f"event=tool_result task={task.task_id} turn={turn_index + 1} "
                         f"call={call_index}/{len(response.tool_calls)} tool={call.name} "
@@ -322,12 +371,31 @@ class SolverEngine:
                         grounding_outputs.append(result.output)
                     if result.ok and result.exact_value is not None:
                         last_exact_value = result.exact_value
+                        turn_exact_value = result.exact_value
 
                     tool_result_blocks.append(
                         _tool_result_block(call.id, result.output, is_error=not result.ok)
                     )
 
                 messages.append({"role": "user", "content": tool_result_blocks})
+                if turn_exact_value is not None:
+                    self._logger(
+                        f"event=auto_finalize task={task.task_id} "
+                        f"reason=TOOL_EXACT_VALUE turn={turn_index + 1} "
+                        f"detail='auto-finalizing tool exact_value immediately'"
+                    )
+                    candidate = self._finalize_candidate(
+                        task=task,
+                        raw_answer=turn_exact_value,
+                        last_exact_value=turn_exact_value,
+                        evidence=tuple(evidence),
+                        grounding_outputs=tuple(grounding_outputs),
+                        turn=turn_index + 1,
+                        total_tokens=total_tokens,
+                    )
+                    return finish(
+                        SolveResult(candidate=candidate, retryable=False)
+                    )
                 continue
 
             # No tool call this turn — look for the final-answer envelope.
@@ -344,11 +412,11 @@ class SolverEngine:
                         turn=turn_index + 1,
                         total_tokens=total_tokens,
                     )
-                    return SolveResult(
+                    return finish(SolveResult(
                         candidate=None,
                         retryable=True,
                         failure_code="NO_ACTIONABLE_OUTPUT",
-                    )
+                    ))
 
                 # A successful runtime tool's exact_value is already the
                 # authoritative, no-retyping answer channel. Live qualifier
@@ -365,45 +433,16 @@ class SolverEngine:
 
             if response.text:
                 evidence.append(_truncate(response.text))
-            candidate = self._build_candidate(
+            candidate = self._finalize_candidate(
                 task=task,
                 raw_answer=raw_answer,
                 last_exact_value=last_exact_value,
                 evidence=tuple(evidence),
                 grounding_outputs=tuple(grounding_outputs),
+                turn=turn_index + 1,
+                total_tokens=total_tokens,
             )
-            outcome = verify_candidate(candidate, task)
-            if not outcome.passed:
-                # Verification vetoed the model's own confidence. This is
-                # not automatically retryable at the solver level — the
-                # candidate is real, just unverified — so we hand it back
-                # with confidence clamped and let Nandh's submission gate
-                # apply the category/tier threshold and decide.
-                candidate = CandidateAnswer(
-                    value=candidate.value,
-                    confidence=outcome.confidence,
-                    evidence=candidate.evidence + outcome.reasons,
-                    strategy=candidate.strategy,
-                    exact_value_from_tool=candidate.exact_value_from_tool,
-                )
-            else:
-                candidate = CandidateAnswer(
-                    value=candidate.value,
-                    confidence=outcome.confidence,
-                    evidence=candidate.evidence,
-                    strategy=candidate.strategy,
-                    exact_value_from_tool=candidate.exact_value_from_tool,
-                )
-
-            self._logger(
-                f"event=candidate task={task.task_id} strategy={candidate.strategy!r} "
-                f"confidence={candidate.confidence:.3f} "
-                f"verified={outcome.passed} exact_tool={candidate.exact_value_from_tool} "
-                f"evidence_count={len(candidate.evidence)} "
-                f"verification_reason_count={len(outcome.reasons)} "
-                f"turn={turn_index + 1} total_tokens={total_tokens}"
-            )
-            return SolveResult(candidate=candidate, retryable=False)
+            return finish(SolveResult(candidate=candidate, retryable=False))
 
         self._log_stop(
             task,
@@ -411,11 +450,57 @@ class SolverEngine:
             turn=self._max_turns,
             total_tokens=total_tokens,
         )
-        return SolveResult(
+        return finish(SolveResult(
             candidate=None,
             retryable=True,
             failure_code="TURN_BUDGET_EXHAUSTED",
+        ))
+
+    def _finalize_candidate(
+        self,
+        *,
+        task: TaskContext,
+        raw_answer: str,
+        last_exact_value: str | None,
+        evidence: tuple[str, ...],
+        grounding_outputs: tuple[str, ...],
+        turn: int,
+        total_tokens: int,
+    ) -> CandidateAnswer:
+        candidate = self._build_candidate(
+            task=task,
+            raw_answer=raw_answer,
+            last_exact_value=last_exact_value,
+            evidence=evidence,
+            grounding_outputs=grounding_outputs,
         )
+        outcome = verify_candidate(candidate, task)
+        if not outcome.passed:
+            # Verification vetoes remain authoritative even on fast paths.
+            candidate = CandidateAnswer(
+                value=candidate.value,
+                confidence=outcome.confidence,
+                evidence=candidate.evidence + outcome.reasons,
+                strategy=candidate.strategy,
+                exact_value_from_tool=candidate.exact_value_from_tool,
+            )
+        else:
+            candidate = CandidateAnswer(
+                value=candidate.value,
+                confidence=outcome.confidence,
+                evidence=candidate.evidence,
+                strategy=candidate.strategy,
+                exact_value_from_tool=candidate.exact_value_from_tool,
+            )
+        self._logger(
+            f"event=candidate task={task.task_id} strategy={candidate.strategy!r} "
+            f"confidence={candidate.confidence:.3f} "
+            f"verified={outcome.passed} exact_tool={candidate.exact_value_from_tool} "
+            f"evidence_count={len(candidate.evidence)} "
+            f"verification_reason_count={len(outcome.reasons)} "
+            f"turn={turn} total_tokens={total_tokens}"
+        )
+        return candidate
 
     def _log_stop(
         self,
@@ -477,6 +562,12 @@ def _initial_user_content(task: TaskContext) -> str:
             # model to pass an absolute path that the runtime sandbox rejects.
             relative_files.append(path.name)
     file_lines = "\n".join(f"- {path}" for path in relative_files) or "(none)"
+    preprocessing = str(task.metadata.get("preprocessing") or "").strip()
+    preflight = (
+        f"\n\nPreflight analysis:\n{preprocessing}"
+        if preprocessing
+        else ""
+    )
     return (
         f"Task ID: {task.task_id}\n"
         f"Category: {task.category}\n"
@@ -485,11 +576,17 @@ def _initial_user_content(task: TaskContext) -> str:
         f"Working directory: {task.workdir}\n"
         f"Attached files:\n{file_lines}\n\n"
         f"Prompt:\n{task.prompt}"
+        f"{preflight}"
     )
 
 
 def _remaining_ms(deadline_monotonic: float) -> int:
     return max(0, int((deadline_monotonic - time.monotonic()) * 1000))
+
+
+def _task_cancelled(task: TaskContext) -> bool:
+    event = task.metadata.get("cancel_event")
+    return bool(event is not None and getattr(event, "is_set", lambda: False)())
 
 
 def _argument_keys(arguments: dict[str, Any]) -> str:

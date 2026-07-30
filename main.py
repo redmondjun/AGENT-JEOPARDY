@@ -10,9 +10,49 @@ reach the submission API.
 from __future__ import annotations
 
 import os
+import shlex
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
+
+
+def _load_local_environment() -> None:
+    """Load private credentials, then fill in tracked deployment defaults."""
+    for filename in (".env", "agent.env"):
+        env_path = Path(__file__).with_name(filename)
+        if not env_path.is_file():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parts = shlex.split(line, comments=True)
+            except ValueError:
+                continue
+            if parts and parts[0] == "export":
+                parts = parts[1:]
+            if len(parts) != 1 or "=" not in parts[0]:
+                continue
+            key, value = parts[0].split("=", 1)
+            if key.isidentifier():
+                os.environ.setdefault(key, os.path.expandvars(value))
+
+
+def _use_local_virtualenv() -> None:
+    """Make `python3 main.py` use the prepared local runtime when necessary."""
+    local_python = Path(__file__).with_name(".venv") / "bin" / "python"
+    if not local_python.is_file():
+        return
+    if Path(sys.prefix).resolve() == local_python.parent.parent.resolve():
+        return
+    os.execv(str(local_python), [str(local_python), *sys.argv])
+
+
+if __name__ == "__main__":
+    _load_local_environment()
+    _use_local_virtualenv()
 
 import jeopardy as jp
 
@@ -191,13 +231,12 @@ def build_orchestrator_config(
 ) -> OrchestratorConfig:
     """Build throughput settings calibrated for the hosted qualifier.
 
-    The Finale board holds hundreds of tiles and the whole stack is open at
-    once, so width is score.  Twelve workers keep the model-call pipeline busy
-    without oversubscribing the two-CPU host: ``run_python``/``run_process``
-    already serialize behind ``processes.CPU_HEAVY_CONCURRENCY`` (2), so extra
-    workers queue for cores rather than fighting over them, and the surplus
-    capacity goes to the I/O-bound categories (The Dark Web, Ancient Scrolls,
-    Cryptic) that spend their time waiting on HTTP and the proxy.
+    Six workers are the measured safe width for the hosted model proxy.
+    Production telemetry showed that retiring claimed tiles early allowed
+    their still-running model calls to overlap replacement workers, pushing
+    effective concurrency and token usage above the 95k/minute proxy limit.
+    Cooperative cancellation now prevents that hidden growth, while six true
+    workers preserve useful I/O overlap without creating a throttle queue.
 
     The 180-second deadline is set deliberately in step with
     ``agent_loop.MAX_TURNS_DEFAULT``: the deadline is checked before every turn,
@@ -216,7 +255,7 @@ def build_orchestrator_config(
         if task_id.strip()
     )
     return OrchestratorConfig(
-        max_workers=int(settings.get("MAX_WORKERS", "12")),
+        max_workers=int(settings.get("MAX_WORKERS", "6")),
         poll_interval_seconds=float(settings.get("POLL_SECONDS", "2")),
         task_timeout_seconds=float(
             settings.get("TASK_TIMEOUT_SECONDS", "180")
@@ -226,6 +265,15 @@ def build_orchestrator_config(
         task_filter=task_filter,
         heartbeat_interval_seconds=float(
             settings.get("HEARTBEAT_INTERVAL_SECONDS", "30")
+        ),
+        task_prefetch_enabled=settings.get("TASK_PREFETCH", "1") == "1",
+        prefetch_workers=int(settings.get("PREFETCH_WORKERS", "2")),
+        prefetch_lookahead=int(settings.get("PREFETCH_LOOKAHEAD", "12")),
+        prefetch_timeout_seconds=float(
+            settings.get("PREFETCH_TIMEOUT_SECONDS", "10")
+        ),
+        prefetch_join_seconds=float(
+            settings.get("PREFETCH_JOIN_SECONDS", "0.25")
         ),
     )
 
@@ -264,7 +312,10 @@ def main() -> None:
         f"max_solve_attempts={config.max_solve_attempts} "
         f"min_confidence={policy.default_minimum_confidence:.3f} "
         f"task_filter_count={len(config.task_filter)} "
-        f"{solver_budget_log_fields(team_solver_loaded)}"
+        f"{solver_budget_log_fields(team_solver_loaded)} "
+        f"task_prefetch={config.task_prefetch_enabled} "
+        f"prefetch_workers={config.prefetch_workers} "
+        f"prefetch_lookahead={config.prefetch_lookahead}"
     )
     orchestrator = build_orchestrator(
         solver, max_tiles=max_tiles, config=config
